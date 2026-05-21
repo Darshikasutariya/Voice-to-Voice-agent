@@ -11,6 +11,30 @@ import {
 const SpeechRecognitionAPI =
   window.SpeechRecognition || window.webkitSpeechRecognition || null
 
+function logTime(msg) {
+  const d = new Date()
+  const ts = `${d.toLocaleTimeString("en-IN", { hour12: false })}.${String(d.getMilliseconds()).padStart(3, '0')}`
+  console.log(`[${ts}] ${msg}`)
+}
+
+/** Decode a base64 string into an ArrayBuffer for Web AudioContext */
+function base64ToArrayBuffer(b64) {
+  const binStr = atob(b64)
+  const bytes  = new Uint8Array(binStr.length)
+  for (let i = 0; i < binStr.length; i++) bytes[i] = binStr.charCodeAt(i)
+  return bytes.buffer
+}
+
+/**
+ * VAD config — tune these if barge-in is too sensitive or too sluggish.
+ * RMS is on a 0-255 scale (byte frequency data average).
+ * We require VAD_FRAMES consecutive loud frames before triggering to avoid
+ * single pops / background noise causing false positives.
+ *  - 60 fps rAF → 5 frames ≈ 83 ms latency (well under the 300 ms target)
+ */
+const VAD_THRESHOLD = 40   // 0-255 — raise if too sensitive to background noise (increased from 20)
+const VAD_FRAMES    = 10   // consecutive loud frames required before barge-in (increased from 5 to ~160ms)
+
 function buildHistoryPayload(messages) {
   return messages
     .filter(
@@ -24,45 +48,65 @@ function buildHistoryPayload(messages) {
 }
 
 export default function App() {
-  const [messages, setMessages] = useState([])
-  const [phase, setPhase] = useState(/** @type {Phase} */ ('idle'))
-  const [wsReady, setWsReady] = useState(false)
-  const [wsError, setWsError] = useState('')
+  const [messages, setMessages]     = useState([])
+  const [phase, setPhase]           = useState(/** @type {Phase} */ ('idle'))
+  const [wsReady, setWsReady]       = useState(false)
+  const [wsError, setWsError]       = useState('')
   const [statusLine, setStatusLine] = useState('')
   const [interimText, setInterimText] = useState('')
-  const [isMuted, setIsMuted] = useState(false)
+  const [isMuted, setIsMuted]       = useState(false)
 
-  const wsRef = useRef(null)
-  const assistantDraftRef = useRef('')
-  const messagesRef = useRef([])
-  const playRef = useRef(/** @type {HTMLAudioElement | null} */ (null))
-  const playUrlRef = useRef(/** @type {string | null} */ (null))
-  const recognitionRef = useRef(/** @type {InstanceType<typeof SpeechRecognitionAPI> | null} */ (null))
-  const phaseRef = useRef(/** @type {Phase} */ ('idle'))
-  const isListeningRef = useRef(false)
-  const mutedRef = useRef(false)
-  /** Set to true once user clicks "Call support" — gates all WS message handling */
-  const callStartedRef = useRef(false)
-  /** Bumped on interrupt / new question — ignore stale WS tokens and TTS callbacks */
-  const replyEpochRef = useRef(0)
-  /** Id of the in-flight WS reply (set when a question is sent) */
-  const activeReplyIdRef = useRef(0)
-  const playbackEpochRef = useRef(0)
+  // ── Core refs ────────────────────────────────────────────────────────────
+  const wsRef              = useRef(null)
+  const assistantDraftRef  = useRef('')
+  const messagesRef        = useRef([])
+  const playRef            = useRef(/** @type {HTMLAudioElement | null} */ (null))
+  const playUrlRef         = useRef(/** @type {string | null} */ (null))
+  const recognitionRef     = useRef(/** @type {InstanceType<typeof SpeechRecognitionAPI> | null} */ (null))
+  const phaseRef           = useRef(/** @type {Phase} */ ('idle'))
+  const isListeningRef     = useRef(false)
+  const mutedRef           = useRef(false)
+  /** Set to true once user clicks "Call support" */
+  const callStartedRef     = useRef(false)
+  /** Bumped on interrupt / new question — invalidates stale WS tokens + TTS */
+  const replyEpochRef      = useRef(0)
+  /** Id of the in-flight WS reply */
+  const activeReplyIdRef   = useRef(0)
+  const playbackEpochRef   = useRef(0)
+  const speakingStartRef   = useRef(0)
+
+  // ── Streaming audio queue (AudioContext-based) ─────────────────────────────
+  const audioCtxRef       = useRef(/** @type {AudioContext | null} */ (null))
+  const audioNodesRef     = useRef(/** @type {AudioBufferSourceNode[]} */ ([]))
+  const nextAudioTimeRef  = useRef(0)            // ctx.currentTime for next chunk
+  const ttsStreamDoneRef  = useRef(false)        // true after tts_done received
+  const pendingChunksRef  = useRef(0)            // chunks in decode/play pipeline
+  const decodingChainRef  = useRef(Promise.resolve()) // serialise decodeAudioData
+  const ttsChunksCountRef = useRef(0)            // tts_chunk count this reply
+
+  // ── VAD refs ─────────────────────────────────────────────────────────────
+  const vadStreamRef      = useRef(/** @type {MediaStream | null} */ (null))
+  const vadContextRef     = useRef(/** @type {AudioContext | null} */ (null))
+  const vadRafRef         = useRef(/** @type {number | null} */ (null))
+  const vadLoudFrames     = useRef(0)
 
   useEffect(() => {
     messagesRef.current = messages
   }, [messages])
 
-  /** Set both state and ref so callbacks always have the current value */
+  // ─────────────────────────────────────────────────────────────────────────
   const updatePhase = useCallback((/** @type {Phase} */ p) => {
+    logTime(`[updatePhase] "${phaseRef.current}" -> "${p}"`)
     phaseRef.current = p
     setPhase(p)
   }, [])
 
-  /** Stop TTS / playback and invalidate in-flight assistant reply handling */
+  // ── Stop TTS / playback and invalidate in-flight reply ───────────────────
   const stopAgentOutput = useCallback(() => {
-    replyEpochRef.current += 1
+    logTime(`[stopAgentOutput] Stopping. epoch→${replyEpochRef.current + 1}`)
+    replyEpochRef.current    += 1
     playbackEpochRef.current += 1
+    speakingStartRef.current  = 0
     assistantDraftRef.current = ''
     window.speechSynthesis?.cancel()
     if (playRef.current) {
@@ -74,78 +118,198 @@ export default function App() {
       URL.revokeObjectURL(playUrlRef.current)
       playUrlRef.current = null
     }
+    // Stop all streamed AudioContext source nodes
+    audioNodesRef.current.forEach((src) => {
+      try { src.stop() } catch {}
+      try { src.disconnect() } catch {}
+    })
+    audioNodesRef.current     = []
+    nextAudioTimeRef.current  = 0
+    ttsStreamDoneRef.current  = false
+    pendingChunksRef.current  = 0
+    ttsChunksCountRef.current = 0
+    decodingChainRef.current  = Promise.resolve()
   }, [])
 
-  /** Drop incomplete streaming assistant bubble after interrupt */
+  // ── Drop incomplete streaming assistant bubble after interrupt ────────────
   const pruneInterruptedAssistant = useCallback(() => {
     setMessages((prev) => {
       const next = [...prev]
       const last = next[next.length - 1]
-      if (
-        last?.role === 'assistant' &&
-        (last.streaming || !last.content?.trim())
-      ) {
+      if (last?.role === 'assistant' && (last.streaming || !last.content?.trim())) {
         next.pop()
       }
       return next
     })
   }, [])
 
-  /** Start mic (allowed during speaking/thinking so user can interrupt) */
+  // ── Start SpeechRecognition ───────────────────────────────────────────────
   const startListening = useCallback(() => {
-    if (mutedRef.current) return
+    if (mutedRef.current) {
+      logTime(`[startListening] Skipped starting SpeechRecognition because mic is muted.`)
+      return
+    }
     const rec = recognitionRef.current
-    if (!rec || isListeningRef.current) return
-    if (phaseRef.current === 'idle') return
+    if (!rec) {
+      logTime(`[startListening] Skipped starting SpeechRecognition because recognitionRef.current is null.`)
+      return
+    }
+    if (isListeningRef.current) {
+      logTime(`[startListening] Skipped starting SpeechRecognition because it is already listening (isListeningRef=true).`)
+      return
+    }
+    if (phaseRef.current === 'idle') {
+      logTime(`[startListening] Skipped starting SpeechRecognition because phase is idle.`)
+      return
+    }
     try {
+      logTime(`[startListening] Calling SpeechRecognition.start()...`)
       rec.start()
       isListeningRef.current = true
       if (phaseRef.current !== 'thinking') {
-        phaseRef.current = 'listening'
-        setPhase('listening')
+        updatePhase('listening')
       }
       setInterimText('')
       setStatusLine('')
-    } catch {
-      // recognition already started — ignore
+    } catch (err) {
+      logTime(`[startListening] SpeechRecognition.start() threw: ${err.message || err} (already running/starting).`)
     }
+  }, [updatePhase])
+
+  // ── VAD: stop ────────────────────────────────────────────────────────────
+  const stopVAD = useCallback(() => {
+    if (vadRafRef.current != null) {
+      cancelAnimationFrame(vadRafRef.current)
+      vadRafRef.current = null
+    }
+    if (vadContextRef.current) {
+      vadContextRef.current.close().catch(() => {})
+      vadContextRef.current = null
+    }
+    if (vadStreamRef.current) {
+      vadStreamRef.current.getTracks().forEach((t) => t.stop())
+      vadStreamRef.current = null
+    }
+    vadLoudFrames.current = 0
   }, [])
 
-  /** Toggle mic mute on/off */
+  // ── VAD: start — always-on AudioContext analyser polling loop ────────────
+  const startVAD = useCallback(
+    (bargeInFn) => {
+      stopVAD()
+      navigator.mediaDevices
+        .getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+          video: false,
+        })
+        .then((stream) => {
+          vadStreamRef.current = stream
+
+          const ctx = new AudioContext()
+          vadContextRef.current = ctx
+
+          const analyser = ctx.createAnalyser()
+          analyser.fftSize = 256  // 128 frequency bins — fast & sufficient
+
+          const src = ctx.createMediaStreamSource(stream)
+          src.connect(analyser)   // NOT connected to destination → no echo
+
+          const buf = new Uint8Array(analyser.frequencyBinCount)
+
+          function tick() {
+            analyser.getByteFrequencyData(buf)
+
+            // Average energy across all frequency bins (0-255 scale)
+            let sum = 0
+            for (let i = 0; i < buf.length; i++) sum += buf[i]
+            const rms = sum / buf.length
+
+            const p = phaseRef.current
+            const now = Date.now()
+            const timeSinceSpeakingStart = speakingStartRef.current ? now - speakingStartRef.current : 0
+            const isRefractory = p === 'speaking' && (!speakingStartRef.current || timeSinceSpeakingStart <= 1000)
+
+            const shouldDetect =
+              !mutedRef.current &&
+              rms > VAD_THRESHOLD &&
+              p === 'speaking' &&
+              !isRefractory
+
+            if (rms > VAD_THRESHOLD && !mutedRef.current) {
+              if (p === 'thinking' || p === 'speaking') {
+                if (shouldDetect) {
+                  vadLoudFrames.current += 1
+                  logTime(`[VAD] Sound detected above threshold (${rms.toFixed(1)} > ${VAD_THRESHOLD}) while speaking. Loud frame count: ${vadLoudFrames.current}/${VAD_FRAMES}`)
+                  if (vadLoudFrames.current >= VAD_FRAMES) {
+                    logTime(`[VAD] Loud frames threshold met. Triggering barge-in callback.`)
+                    vadLoudFrames.current = 0
+                    bargeInFn()
+                  }
+                } else {
+                  if (isRefractory) {
+                    logTime(`[VAD] Ignored sound (${rms.toFixed(1)} > ${VAD_THRESHOLD}) during speaking refractory period (${timeSinceSpeakingStart}ms)`)
+                  } else {
+                    logTime(`[VAD] Ignored sound (${rms.toFixed(1)} > ${VAD_THRESHOLD}) during phase: "${p}"`)
+                  }
+                  vadLoudFrames.current = 0
+                }
+              } else {
+                vadLoudFrames.current = 0
+              }
+            } else {
+              vadLoudFrames.current = 0
+            }
+
+            vadRafRef.current = requestAnimationFrame(tick)
+          }
+
+          vadRafRef.current = requestAnimationFrame(tick)
+        })
+        .catch(() => {
+          // Mic denied or not available — VAD silently disabled; user can still
+          // tap to interrupt via the stop agent output path.
+        })
+    },
+    [stopVAD],
+  )
+
+  // ── Toggle mute ───────────────────────────────────────────────────────────
   const toggleMute = useCallback(() => {
     const nowMuted = !mutedRef.current
     mutedRef.current = nowMuted
     setIsMuted(nowMuted)
 
     if (nowMuted) {
-      // Stop recognition immediately
       const rec = recognitionRef.current
       if (rec && isListeningRef.current) {
-        try { rec.stop() } catch {}
+        try { rec.stop(); } catch { /* ignore */ }
       }
       isListeningRef.current = false
       setInterimText('')
-      // Move to 'active' so the avatar shows on-call but not listening
       if (phaseRef.current === 'listening') {
-        phaseRef.current = 'active'
-        setPhase('active')
+        updatePhase('active')
       }
     } else {
-      // Unmuted — restart listening if call is active
       if (phaseRef.current === 'active' || phaseRef.current === 'listening') {
-        phaseRef.current = 'active'
-        setPhase('active')
+        updatePhase('active')
         setTimeout(() => startListening(), 150)
       }
     }
-  }, [startListening])
+  }, [startListening, updatePhase])
 
+  // ── Send question to backend ──────────────────────────────────────────────
   const sendQuestion = useCallback(
     (questionText) => {
       const q = String(questionText ?? '').trim()
       if (!q) return
+      logTime(`[sendQuestion] Sending final question: "${q}"`)
       const ws = wsRef.current
       if (!ws || ws.readyState !== WebSocket.OPEN) {
+        logTime(`[sendQuestion] WebSocket not open! readyState=${ws?.readyState}`)
         setStatusLine('Not connected — wait for reconnect.')
         updatePhase('active')
         return
@@ -159,6 +323,7 @@ export default function App() {
 
       const historyForApi = buildHistoryPayload(messagesRef.current)
       activeReplyIdRef.current = replyEpochRef.current
+      logTime(`[sendQuestion] Generated activeReplyIdRef = ${activeReplyIdRef.current}`)
 
       setMessages((prev) => [
         ...prev,
@@ -176,23 +341,33 @@ export default function App() {
         }
       }
       ws.send(JSON.stringify(payload))
+      logTime(`[sendQuestion] WebSocket payload sent.`)
 
-      // Keep mic on during thinking so the user can interrupt again
+      // Keep mic open during thinking so the user can barge in again
       setTimeout(() => {
-        if (activeReplyIdRef.current === replyEpochRef.current) startListening()
+        if (activeReplyIdRef.current === replyEpochRef.current) {
+          logTime(`[sendQuestion] Re-starting listening after 150ms delay.`)
+          startListening()
+        }
       }, 150)
     },
     [updatePhase, stopAgentOutput, pruneInterruptedAssistant, startListening],
   )
 
+  // ── Play agent TTS reply ──────────────────────────────────────────────────
   const playAgentReply = useCallback(
     async (text, replyId) => {
       const t = String(text ?? '').trim()
       if (!t) return
-      if (!replyId || replyId !== activeReplyIdRef.current) return
+      logTime(`[playAgentReply] playAgentReply called. text="${t.slice(0, 40)}...", replyId=${replyId}, active=${activeReplyIdRef.current}`)
+      if (replyId == null || replyId !== activeReplyIdRef.current) {
+        logTime(`[playAgentReply] Ignored playAgentReply call because replyId doesn't match activeReplyId (${activeReplyIdRef.current})`)
+        return
+      }
 
       playbackEpochRef.current += 1
       const playEpoch = playbackEpochRef.current
+      logTime(`[playAgentReply] Set playEpoch = ${playEpoch}`)
       window.speechSynthesis?.cancel()
       if (playRef.current) {
         playRef.current.pause()
@@ -204,41 +379,90 @@ export default function App() {
         playUrlRef.current = null
       }
 
-      updatePhase('speaking')
-      startListening()
+      // VAD (AudioContext) stays running so it can still detect barge-in.
+      const rec = recognitionRef.current
 
       const onDone = () => {
-        if (playEpoch !== playbackEpochRef.current) return
-        if (!replyId || replyId !== activeReplyIdRef.current) return
+        if (playEpoch !== playbackEpochRef.current) {
+          logTime(`[playAgentReply] onDone ignored: playEpoch mismatch. playEpoch=${playEpoch}, current=${playbackEpochRef.current}`)
+          return
+        }
+        if (replyId == null || replyId !== activeReplyIdRef.current) {
+          logTime(`[playAgentReply] onDone ignored: activeReplyId mismatch. replyId=${replyId}, active=${activeReplyIdRef.current}`)
+          return
+        }
+        logTime(`[playAgentReply] Playback completed. Transitioning back to active.`)
         updatePhase('active')
-        setTimeout(() => startListening(), 300)
+        setTimeout(() => {
+          logTime(`[playAgentReply] Re-starting listening after 300ms post-play delay.`)
+          startListening()
+        }, 300)
       }
 
       const fallbackSpeak = () => {
         if (playEpoch !== playbackEpochRef.current) return
+        logTime(`[playAgentReply] Triggering browser SpeechSynthesis fallback...`)
+        
+        updatePhase('speaking')
+        speakingStartRef.current = 0
+        if (rec && isListeningRef.current) {
+          logTime(`[playAgentReply] Stopping SpeechRecognition to prevent echo feedback.`)
+          try { rec.stop(); } catch { /* ignore */ }
+          isListeningRef.current = false
+        }
+
         window.speechSynthesis?.cancel()
         const utt = new SpeechSynthesisUtterance(t)
-        utt.lang = 'en-IN'
-        utt.rate = 1.02
-        utt.onend = onDone
+        utt.lang  = 'en-IN'
+        utt.rate  = 1.02
+        utt.onstart = () => {
+          speakingStartRef.current = Date.now()
+          logTime(`[playAgentReply] Fallback SpeechSynthesis started. Refractory period started.`)
+        }
+        utt.onend = () => {
+          logTime(`[playAgentReply] Fallback SpeechSynthesis completed.`)
+          onDone()
+        }
         window.speechSynthesis?.speak(utt)
       }
 
       try {
+        logTime(`[playAgentReply] Fetching TTS audio from backend API...`)
         const res = await fetch(`${apiOrigin}/api/voice/tts`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...voiceHeaders() },
           body: JSON.stringify({ text: t }),
         })
-        if (!replyId || replyId !== activeReplyIdRef.current) return
+        if (replyId == null || replyId !== activeReplyIdRef.current) {
+          logTime(`[playAgentReply] TTS fetch returned, but request is now stale. Aborting.`)
+          return
+        }
         if (!res.ok) throw new Error(await res.text())
         const blob = await res.blob()
-        if (!replyId || replyId !== activeReplyIdRef.current) return
+        if (replyId == null || replyId !== activeReplyIdRef.current) {
+          logTime(`[playAgentReply] Blob conversion completed, but request is now stale. Aborting.`)
+          return
+        }
+        logTime(`[playAgentReply] TTS fetch succeeded, size: ${blob.size} bytes. Initializing Audio playback...`)
+
+        updatePhase('speaking')
+        speakingStartRef.current = 0
+        if (rec && isListeningRef.current) {
+          logTime(`[playAgentReply] Stopping SpeechRecognition to prevent echo feedback.`)
+          try { rec.stop(); } catch { /* ignore */ }
+          isListeningRef.current = false
+        }
+
         const url = URL.createObjectURL(blob)
         playUrlRef.current = url
-        const a = new Audio(url)
+        const a  = new Audio(url)
         playRef.current = a
+        a.onplaying = () => {
+          speakingStartRef.current = Date.now()
+          logTime(`[playAgentReply] HTML5 Audio playing event fired. Refractory period started.`)
+        }
         a.onended = () => {
+          logTime(`[playAgentReply] HTML5 Audio ended event fired.`)
           if (playUrlRef.current === url) {
             URL.revokeObjectURL(url)
             playUrlRef.current = null
@@ -246,12 +470,123 @@ export default function App() {
           onDone()
         }
         await a.play()
-      } catch {
-        if (replyId && replyId === activeReplyIdRef.current) fallbackSpeak()
+        logTime(`[playAgentReply] HTML5 Audio play() promise resolved. Playing audio...`)
+      } catch (err) {
+        logTime(`[playAgentReply] TTS generation or playback failed: ${err.message || err}`)
+        if (replyId != null && replyId === activeReplyIdRef.current) fallbackSpeak()
       }
     },
     [updatePhase, startListening],
   )
+
+  // ── Audio queue: check if everything has played ──────────────────────────
+  const checkAudioPlaybackDone = useCallback((replyId) => {
+    if (replyId !== activeReplyIdRef.current) return
+    if (!ttsStreamDoneRef.current) return
+    if (pendingChunksRef.current > 0) return
+    logTime(`[AudioQueue] ✅ All chunks played. Moving to active.`)
+    updatePhase('active')
+    setTimeout(() => {
+      logTime(`[AudioQueue] Re-starting listening after 300ms.`)
+      startListening()
+    }, 300)
+  }, [updatePhase, startListening])
+
+  // ── Audio queue: decode & schedule one TTS chunk ─────────────────────────
+  const enqueueAudioChunk = useCallback((base64, chunkId, replyId) => {
+    if (replyId !== activeReplyIdRef.current) return
+
+    // Lazy-create or reuse the AudioContext for this call session
+    if (!audioCtxRef.current || audioCtxRef.current.state === 'closed') {
+      audioCtxRef.current = new AudioContext()
+      nextAudioTimeRef.current = 0
+    }
+    if (audioCtxRef.current.state === 'suspended') {
+      audioCtxRef.current.resume().catch(() => {})
+    }
+
+    // Serialise decoding so chunks are scheduled in arrival order
+    decodingChainRef.current = decodingChainRef.current.then(async () => {
+      // Stale check after potential async gap
+      if (replyId !== activeReplyIdRef.current) {
+        pendingChunksRef.current = Math.max(0, pendingChunksRef.current - 1)
+        checkAudioPlaybackDone(replyId)
+        return
+      }
+      const ctx = audioCtxRef.current
+      if (!ctx || ctx.state === 'closed') {
+        pendingChunksRef.current = Math.max(0, pendingChunksRef.current - 1)
+        checkAudioPlaybackDone(replyId)
+        return
+      }
+
+      // Decode base64 → AudioBuffer
+      let audioBuffer
+      try {
+        const ab = base64ToArrayBuffer(base64)
+        audioBuffer = await ctx.decodeAudioData(ab)
+      } catch (err) {
+        logTime(`[AudioQueue] ❌ Decode failed #${chunkId}: ${err.message || err}`)
+        pendingChunksRef.current = Math.max(0, pendingChunksRef.current - 1)
+        checkAudioPlaybackDone(replyId)
+        return
+      }
+
+      // Stale check again after the async decode
+      if (replyId !== activeReplyIdRef.current) {
+        pendingChunksRef.current = Math.max(0, pendingChunksRef.current - 1)
+        return
+      }
+
+      // Schedule playback — seamlessly after previous chunk
+      const isFirstChunk        = nextAudioTimeRef.current === 0
+      const now                 = ctx.currentTime
+      const startAt             = Math.max(nextAudioTimeRef.current, now + 0.04)
+      nextAudioTimeRef.current  = startAt + audioBuffer.duration
+
+      const src = ctx.createBufferSource()
+      src.buffer = audioBuffer
+      src.connect(ctx.destination)
+      audioNodesRef.current.push(src)
+      src.start(startAt)
+      logTime(`[AudioQueue] ▶ Chunk #${chunkId} @ +${(startAt - now).toFixed(3)}s, dur=${audioBuffer.duration.toFixed(2)}s`)
+
+      if (isFirstChunk) {
+        // Transition to speaking phase when first audio byte is about to play
+        updatePhase('speaking')
+        speakingStartRef.current = 0
+        // Stop SpeechRecognition to prevent microphone echo feedback
+        const rec = recognitionRef.current
+        if (rec && isListeningRef.current) {
+          try { rec.stop() } catch {}
+          isListeningRef.current = false
+        }
+        // Set refractory timestamp exactly when audio starts emitting
+        const msUntilPlay = Math.max(0, (startAt - now) * 1000)
+        setTimeout(() => {
+          if (replyId === activeReplyIdRef.current) {
+            speakingStartRef.current = Date.now()
+            logTime(`[AudioQueue] Refractory window started.`)
+          }
+        }, msUntilPlay)
+      }
+
+      src.onended = () => {
+        audioNodesRef.current = audioNodesRef.current.filter((n) => n !== src)
+        pendingChunksRef.current = Math.max(0, pendingChunksRef.current - 1)
+        logTime(`[AudioQueue] Chunk #${chunkId} ended. pending=${pendingChunksRef.current}`)
+        checkAudioPlaybackDone(replyId)
+      }
+    })
+  }, [updatePhase, checkAudioPlaybackDone])
+
+  // ── Audio queue: tts_done signal from backend ────────────────────────────
+  const handleTtsStreamDone = useCallback((replyId) => {
+    if (replyId !== activeReplyIdRef.current) return
+    logTime(`[AudioQueue] tts_done signal. pending=${pendingChunksRef.current}`)
+    ttsStreamDoneRef.current = true
+    checkAudioPlaybackDone(replyId)
+  }, [checkAudioPlaybackDone])
 
   // ── WebSocket connection + auto-reconnect ─────────────────────────────────
   useEffect(() => {
@@ -267,15 +602,38 @@ export default function App() {
       let data
       try { data = JSON.parse(ev.data) } catch { return }
 
-      const isStaleReply = () =>
-        activeReplyIdRef.current === 0 ||
-        replyEpochRef.current !== activeReplyIdRef.current
+      const isStaleReply = () => {
+        const stale = activeReplyIdRef.current === 0 ||
+          replyEpochRef.current !== activeReplyIdRef.current
+        if (stale) {
+          logTime(`[WebSocket handleMessage] Ignored message of type "${data.type}" because reply is stale. activeReplyId=${activeReplyIdRef.current}, replyEpoch=${replyEpochRef.current}`)
+        }
+        return stale
+      }
+
+      // ── Streaming audio chunk from backend TTS chunker ───────────────────
+      if (data.type === 'tts_chunk' && data.audio) {
+        logTime(`[WS] tts_chunk #${data.chunkId ?? 0} received`)
+        if (isStaleReply()) return
+        ttsChunksCountRef.current++
+        pendingChunksRef.current++
+        enqueueAudioChunk(data.audio, data.chunkId ?? 0, activeReplyIdRef.current)
+        return
+      }
+
+      // ── All TTS chunks have been sent ─────────────────────────────────────
+      if (data.type === 'tts_done') {
+        logTime(`[WS] tts_done received`)
+        if (isStaleReply()) return
+        handleTtsStreamDone(activeReplyIdRef.current)
+        return
+      }
 
       if (data.type === 'token' && data.text) {
+        logTime(`[WebSocket handleMessage] Received token: "${data.text}"`)
         if (isStaleReply()) return
         assistantDraftRef.current += data.text
-        setPhase('thinking')
-        phaseRef.current = 'thinking'
+        updatePhase('thinking')
         setMessages((prev) => {
           const next = [...prev]
           const i = next.length - 1
@@ -288,8 +646,9 @@ export default function App() {
       }
 
       if (data.type === 'done') {
+        logTime(`[WebSocket handleMessage] Received "done" event. sourcesCount=${data.sources?.length ?? 0}`)
         if (isStaleReply()) return
-        const full = assistantDraftRef.current
+        const full    = assistantDraftRef.current
         const replyId = activeReplyIdRef.current
         assistantDraftRef.current = ''
         setMessages((prev) => {
@@ -300,11 +659,19 @@ export default function App() {
           }
           return next
         })
-        void playAgentReply(full, replyId)
+        // If TTS chunks were streamed, audio is already queued — skip HTTP TTS.
+        // Fall back to HTTP TTS only when no chunks arrived (complete TTS failure).
+        if (ttsChunksCountRef.current === 0) {
+          logTime(`[WS] No TTS chunks received — HTTP TTS fallback`)
+          void playAgentReply(full, replyId)
+        } else {
+          logTime(`[WS] Audio streaming active (${ttsChunksCountRef.current} chunks). Skipping HTTP TTS.`)
+        }
         return
       }
 
       if (data.type === 'error') {
+        logTime(`[WebSocket handleMessage] Received "error" event: ${JSON.stringify(data)}`)
         if (data.code === 'busy') return
         if (isStaleReply()) return
         setWsError(data.message || data.code || 'chat error')
@@ -323,7 +690,10 @@ export default function App() {
           }
           return next
         })
-        setTimeout(() => startListening(), 500)
+        setTimeout(() => {
+          logTime(`[WebSocket handleMessage] Re-starting listening after 500ms post-error delay.`)
+          startListening()
+        }, 500)
       }
     }
 
@@ -341,7 +711,7 @@ export default function App() {
       reconnectTimer = null
       ws = new WebSocket(url)
       wsRef.current = ws
-      ws.onopen = () => { attempt = 0; setWsReady(true); setWsError('') }
+      ws.onopen  = () => { attempt = 0; setWsReady(true); setWsError('') }
       ws.onmessage = handleMessage
       ws.onerror = () => setWsError('WebSocket error — is the backend running?')
       ws.onclose = () => {
@@ -358,9 +728,9 @@ export default function App() {
       ws?.close()
       wsRef.current = null
     }
-  }, [playAgentReply, updatePhase, startListening])
+  }, [playAgentReply, updatePhase, startListening, enqueueAudioChunk, handleTtsStreamDone])
 
-  // ── Start call: set up SpeechRecognition and begin auto-listen ───────────
+  // ── Start call ───────────────────────────────────────────────────────────
   const startCall = useCallback(() => {
     if (!SpeechRecognitionAPI) {
       updatePhase('active')
@@ -369,9 +739,9 @@ export default function App() {
     }
 
     const rec = new SpeechRecognitionAPI()
-    rec.lang = 'en-IN'
-    rec.continuous = false      // fire one result per utterance
-    rec.interimResults = true   // show live transcription while speaking
+    rec.lang           = 'en-IN'
+    rec.continuous     = false   // fire one result per utterance
+    rec.interimResults = true    // live transcription
 
     rec.onresult = (e) => {
       const results = Array.from(e.results)
@@ -388,24 +758,6 @@ export default function App() {
 
       setInterimText(interim)
 
-      const p = phaseRef.current
-      const userSpeaking =
-        interim.length >= 2 || final.length >= 2
-
-      if (
-        userSpeaking &&
-        (p === 'speaking' || p === 'thinking')
-      ) {
-        stopAgentOutput()
-        activeReplyIdRef.current = 0
-        pruneInterruptedAssistant()
-        updatePhase('listening')
-        try {
-          rec.stop()
-        } catch {}
-        isListeningRef.current = false
-      }
-
       if (final) {
         isListeningRef.current = false
         setInterimText('')
@@ -420,14 +772,12 @@ export default function App() {
         setStatusLine('Microphone permission denied. Please allow mic access.')
         updatePhase('active')
       }
-      // 'no-speech', 'audio-capture', etc. → onend will restart automatically
+      // 'no-speech', 'audio-capture' → onend restarts automatically
     }
 
     rec.onend = () => {
       isListeningRef.current = false
       setInterimText('')
-      // Auto-restart only when in 'listening' or 'active' phase AND not muted
-      // Use startListening() so mutedRef and phaseRef guards run in one place
       const p = phaseRef.current
       if (!mutedRef.current && (p === 'listening' || p === 'active')) {
         setTimeout(() => startListening(), 200)
@@ -436,12 +786,34 @@ export default function App() {
 
     recognitionRef.current = rec
     callStartedRef.current = true
-    updatePhase('speaking')  // show speaking state while greeting plays
-    // Play the greeting now that recognition is ready.
-    // playAgentReply sets phase→speaking, and its onDone sets phase→active
-    // then calls startListening() — that is the ONLY place the mic starts.
+
+    // ── Barge-in callback — fired by VAD when voice detected during agent output ──
+    const bargeIn = () => {
+      const p = phaseRef.current
+      logTime(`[bargeIn] Barge-in callback triggered. currentPhase="${p}"`)
+      if (p !== 'speaking' && p !== 'thinking') {
+        logTime(`[bargeIn] Ignored barge-in because phase is not speaking/thinking.`)
+        return
+      }
+      logTime(`[bargeIn] Executing stopAgentOutput and canceling in-flight response.`)
+      stopAgentOutput()
+      activeReplyIdRef.current = 0
+      pruneInterruptedAssistant()
+      updatePhase('listening')
+      // Small delay so any SpeechRecognition stop() settles before we restart
+      setTimeout(() => {
+        logTime(`[bargeIn] Re-starting listening after 80ms post-bargein delay.`)
+        startListening()
+      }, 80)
+    }
+
+    // Start always-on VAD — runs on a separate AudioContext stream,
+    // independent of SpeechRecognition state.
+    startVAD(bargeIn)
+
     void playAgentReply(
-      "Hello! I'm your TaxOne support agent. How can I help you today?"
+      "Hello! I'm your TaxOne support agent. How can I help you today?",
+      activeReplyIdRef.current,
     )
   }, [
     sendQuestion,
@@ -450,21 +822,29 @@ export default function App() {
     playAgentReply,
     stopAgentOutput,
     pruneInterruptedAssistant,
+    startVAD,
   ])
 
+  // ── End call ─────────────────────────────────────────────────────────────
   const endCall = useCallback(() => {
-    callStartedRef.current = false  // reset so next call starts fresh
+    callStartedRef.current = false
     const rec = recognitionRef.current
     if (rec) {
       rec.onresult = null
-      rec.onerror = null
-      rec.onend = null
-      try { rec.stop() } catch {}
+      rec.onerror  = null
+      rec.onend    = null
+      try { rec.stop(); } catch { /* ignore */ }
       recognitionRef.current = null
     }
     isListeningRef.current = false
     stopAgentOutput()
-    replyEpochRef.current = 0
+    stopVAD()
+    // Close AudioContext to free OS audio resources
+    if (audioCtxRef.current && audioCtxRef.current.state !== 'closed') {
+      audioCtxRef.current.close().catch(() => {})
+      audioCtxRef.current = null
+    }
+    replyEpochRef.current    = 0
     activeReplyIdRef.current = 0
     playbackEpochRef.current = 0
     setMessages([])
@@ -473,18 +853,19 @@ export default function App() {
     updatePhase('idle')
     setStatusLine('')
     setWsError('')
-  }, [updatePhase, stopAgentOutput])
+  }, [updatePhase, stopAgentOutput, stopVAD])
 
+  // ── Derived UI ────────────────────────────────────────────────────────────
   const lastAssistant = messages.filter((m) => m.role === 'assistant').pop()
-  const lastUser = messages.filter((m) => m.role === 'user').pop()
+  const lastUser      = messages.filter((m) => m.role === 'user').pop()
 
   const phaseLabel =
-    phase === 'idle' ? 'Ready' :
-    isMuted ? 'Muted' :
-    phase === 'active' ? 'On call' :
-    phase === 'listening' ? 'Listening…' :
+    phase === 'idle'     ? 'Ready' :
+    isMuted              ? 'Muted' :
+    phase === 'active'   ? 'On call' :
+    phase === 'listening'? 'Listening…' :
     phase === 'thinking' ? 'Agent is thinking…' :
-    'Agent is speaking'
+                           'Agent is speaking'
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col items-center px-4 py-8">
@@ -494,7 +875,7 @@ export default function App() {
         <div className="px-6 pt-8 pb-6 text-center border-b border-slate-800">
           <p className="text-xs uppercase tracking-widest text-slate-500">Vyapar TaxOne</p>
           <h1 className="text-xl font-semibold mt-1">Support call</h1>
-          <p className="text-xs text-slate-500 mt-1">Voice agent · RAG</p>
+          <p className="text-xs text-slate-500 mt-1">Voice agent · RAG · Barge-in enabled</p>
         </div>
 
         {/* Avatar + status */}
@@ -520,6 +901,12 @@ export default function App() {
 
           <p className="text-sm font-medium text-slate-300">{phaseLabel}</p>
 
+          {phase === 'speaking' && !isMuted && (
+            <p className="text-[11px] text-sky-400/60 mt-1 text-center">
+              Just start talking to interrupt
+            </p>
+          )}
+
           {(wsError || (!wsReady && phase !== 'idle')) && (
             <p className="text-xs text-amber-400 mt-2 text-center">
               {wsError || 'Connecting…'}
@@ -533,7 +920,7 @@ export default function App() {
           {/* Live interim transcription while user is speaking */}
           {interimText && (
             <p className="text-xs text-emerald-400/70 mt-3 italic text-center px-4">
-              "{interimText}"
+              &ldquo;{interimText}&rdquo;
             </p>
           )}
 
@@ -574,8 +961,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={toggleMute}
-                disabled={phase === 'thinking'}
-                className={`w-full py-3 rounded-2xl font-medium text-sm transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
+                className={`w-full py-3 rounded-2xl font-medium text-sm transition-colors ${
                   isMuted
                     ? 'bg-amber-600/80 hover:bg-amber-500 text-white'
                     : 'bg-slate-700 hover:bg-slate-600 text-slate-100'
@@ -598,7 +984,7 @@ export default function App() {
       </div>
 
       <p className="text-[11px] text-slate-600 mt-6 text-center max-w-sm">
-        STT: Browser Web Speech API (Chrome only) · TTS: Sarvam
+        STT: Browser Web Speech API (Chrome) · TTS: Sarvam · VAD: Web Audio API
       </p>
     </div>
   )

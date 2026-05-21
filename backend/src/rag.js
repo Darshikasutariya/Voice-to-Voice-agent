@@ -130,6 +130,11 @@ export async function ragAnswer(question, history = []) {
   };
 }
 
+function ts() {
+  const d = new Date();
+  return `${d.toLocaleTimeString("en-IN", { hour12: false })}.${String(d.getMilliseconds()).padStart(3, "0")}`;
+}
+
 /**
  * Same RAG as ragAnswer, but streams tokens via emit({ type, ... }).
  * @param {string} question
@@ -141,8 +146,15 @@ export async function streamRagAnswer(question, emit, history = [], signal) {
   assertOpenAI();
   const safeHistory = parseChatHistory(history);
 
+  console.log(`[${ts()}] [RAG] Starting similarity search for: "${question}"`);
+  const startSearch = Date.now();
   const hits = await searchSimilar(question, 4);
-  if (signal?.aborted) return;
+  const searchDuration = Date.now() - startSearch;
+  console.log(`[${ts()}] [RAG] Similarity search finished in ${searchDuration}ms. Hits found: ${hits.length}`);
+  if (signal?.aborted) {
+    console.log(`[${ts()}] [RAG] Signal aborted after search. Exiting.`);
+    return;
+  }
 
   if (hits.length === 0) {
     emit({ type: "token", text: NO_DOCS_MSG });
@@ -157,16 +169,31 @@ export async function streamRagAnswer(question, emit, history = [], signal) {
     apiKey: config.openai.apiKey,
   });
 
+  console.log(`[${ts()}] [RAG] Initializing ChatOpenAI stream...`);
+  const startLlmStream = Date.now();
   const stream = await llm.stream(
     buildLlmMessages(context, safeHistory, question),
     { signal },
   );
 
+  let firstChunkReceived = false;
   for await (const chunk of stream) {
-    if (signal?.aborted) return;
+    if (signal?.aborted) {
+      console.log(`[${ts()}] [RAG] Signal aborted during stream. Exiting.`);
+      return;
+    }
     const text = textFromChunk(chunk);
-    if (text) emit({ type: "token", text });
+    if (text) {
+      if (!firstChunkReceived) {
+        firstChunkReceived = true;
+        const timeToFirstToken = Date.now() - startLlmStream;
+        console.log(`[${ts()}] [RAG] First LLM token chunk received. Time-to-first-token: ${timeToFirstToken}ms`);
+      }
+      emit({ type: "token", text });
+    }
   }
 
+  const streamDuration = Date.now() - startLlmStream;
+  console.log(`[${ts()}] [RAG] LLM stream completed in ${streamDuration}ms total.`);
   if (!signal?.aborted) emit({ type: "done", sources });
 }

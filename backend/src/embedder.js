@@ -19,12 +19,14 @@ export class BgeM3Embeddings extends Embeddings {
   async _ensureReady() {
     if (this.pipe) return;
     if (!this._loadPromise) {
+      const startLoad = Date.now();
       console.log(`[embed] loading ${this.modelId} ...`);
       console.log(`[embed] first run downloads ~500MB to ~/.cache/huggingface`);
       this._loadPromise = pipeline("feature-extraction", this.modelId).then(
         (p) => {
           this.pipe = p;
-          console.log(`[embed] model ready`);
+          const loadDuration = Date.now() - startLoad;
+          console.log(`[embed] model ready (loaded in ${loadDuration}ms)`);
         },
       );
     }
@@ -32,6 +34,7 @@ export class BgeM3Embeddings extends Embeddings {
   }
 
   async embedDocuments(texts) {
+    const startEmbed = Date.now();
     await this._ensureReady();
     const { batchSize, pooling, normalize } = config.embed;
     const out = [];
@@ -48,6 +51,8 @@ export class BgeM3Embeddings extends Embeddings {
       }
     }
 
+    const embedDuration = Date.now() - startEmbed;
+    console.log(`[embed] Generated embeddings for ${texts.length} documents in ${embedDuration}ms`);
     return out;
   }
 
