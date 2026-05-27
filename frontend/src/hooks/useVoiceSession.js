@@ -8,8 +8,8 @@ function logTime(msg) {
 }
 
 // VAD tuning — same values as before
-const VAD_THRESHOLD = 65
-const VAD_FRAMES = 12
+const VAD_THRESHOLD = 40
+const VAD_FRAMES = 10
 
 /**
  * Voice session hook: WebSocket connection, MediaRecorder streaming,
@@ -227,7 +227,16 @@ export function useVoiceSession({ audio, history, setInterimText, setPhase, getP
     }
 
     if (data.type === 'interim_transcript') {
-      setInterimText(data.text)
+      // Only show interim transcripts when we're actually listening for user input.
+      // Late events from other Deepgram sockets can arrive during thinking/speaking
+      // phases — those are stale and should not be displayed.
+      const p = phaseRef.current
+      if (p === 'listening' || p === 'active') {
+        setInterimText(data.text)
+      } else {
+        // Defensive: ensure no stale interim text lingers during thinking/speaking
+        setInterimText('')
+      }
       return
     }
 
