@@ -2,12 +2,15 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import dotenv from "dotenv";
 
-// Disable TLS verification to bypass corporate proxy self-signed certificates
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
-
 // Always load backend/.env (this file lives in backend/src/)
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: path.resolve(__dirname, "..", ".env") });
+
+// Disable TLS verification ONLY in development (for corporate proxies / self-signed certs).
+// In production this would be a security hole — set NODE_ENV=production to enforce.
+if (process.env.NODE_ENV !== "production") {
+  process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+}
 
 /** @param {string | undefined} raw @param {number} fallback */
 function parsePort(raw, fallback) {
@@ -66,7 +69,7 @@ export const config = {
     scrapeOutput: "./data/scraped.json",
   },
 
-  /** HTTP + future WebSocket process */
+  /** HTTP + WebSocket process */
   server: {
     host: process.env.HOST?.trim() || "0.0.0.0",
     port: parsePort(process.env.PORT, 3001),
@@ -78,9 +81,7 @@ export const config = {
     model: process.env.OPENAI_MODEL?.trim() || "gpt-4o-mini",
   },
 
-  /**
-   Hardening (step 6): leave CHAT_API_KEY empty to disable auth (local dev).
-   */
+  /** Set CHAT_API_KEY empty in .env to disable auth (local dev). */
   security: {
     chatApiKey: process.env.CHAT_API_KEY?.trim() ?? "",
     httpRateLimitWindowMs: parsePositiveInt(
@@ -93,11 +94,11 @@ export const config = {
       60_000,
     ),
     wsRateLimitMax: parsePositiveInt(process.env.WS_RATE_LIMIT_MAX, 20),
-    /** Set to "1" behind a reverse proxy so client IP / rate-limit uses X-Forwarded-For */
+    /** Set "1" behind a reverse proxy so client IP uses X-Forwarded-For */
     trustProxy: process.env.TRUST_PROXY?.trim() === "1",
   },
 
-  /** Voice: STT = Deepgram or Sarvam; TTS = Sarvam (keys in .env). */
+  /** Voice: STT via Deepgram (streaming) or Sarvam, TTS via Sarvam. */
   voice: {
     sttProvider: (process.env.VOICE_STT_PROVIDER || "deepgram")
       .trim()
