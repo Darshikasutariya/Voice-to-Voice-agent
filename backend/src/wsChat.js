@@ -1,7 +1,10 @@
+import WebSocket from "ws";
+import { config } from "./config.js";
 import { streamRagAnswer, parseChatHistory } from "./rag.js";
 import { isChatApiKeyValid } from "./security.js";
 import { createWindowLimiter } from "./rateLimit.js";
 import { createTtsChunker } from "./voice/ttsChunker.js";
+import { detectLanguage } from "./utils/langDetect.js";
 
 const MAX_MESSAGE_BYTES = 64 * 1024;
 
@@ -39,23 +42,220 @@ export function attachChatSocket(wss, opts) {
     const ip = req.socket.remoteAddress ?? "unknown";
     console.log(`\n[${ts()}] 🟢 New client connected  (ip: ${ip})`);
 
-    // ── Greeting ─────────────────────────────────────────────────────────────
-    // The frontend ignores WS messages until the user clicks "Call support",
-    // so these messages will be dropped on the client. The greeting is played
-    // client-side via a direct HTTP TTS call in startCall().
-    safeSend(socket, { type: "token", text: GREETING });
-    safeSend(socket, { type: "done",  sources: [] });
-    console.log(`[${ts()}] 🤖 Agent  : ${GREETING}`);
+    // Chat history for this socket session
+    const chatHistory = [];
 
+    // Parse language and apiKey from URL
+    let language = "multi";
     let keyFromUrl = "";
     try {
-      keyFromUrl =
-        new URL(req.url || "/", "http://localhost").searchParams
-          .get("apiKey")
-          ?.trim() ?? "";
+      const urlParams = new URL(req.url || "/", "http://localhost").searchParams;
+      language = urlParams.get("language")?.trim() || "multi";
+      keyFromUrl = urlParams.get("apiKey")?.trim() ?? "";
     } catch {
       // ignore bad URL
     }
+
+    console.log(`[${ts()}] 👤 Client preferred language: "${language}"`);
+
+    // Connect to Deepgram Streaming API (Parallel sockets for en, hi, gu)
+    const dgKey = config.voice.deepgramApiKey;
+    
+    const dgSockets = {
+      en: { ws: null, open: false, buffer: [] },
+      hi: { ws: null, open: false, buffer: [] },
+      gu: { ws: null, open: false, buffer: [] }
+    };
+
+    const turnState = {
+      en: { accumulatedText: "", confidenceSum: 0, confidenceCount: 0, interimText: "", speechFinalReceived: false },
+      hi: { accumulatedText: "", confidenceSum: 0, confidenceCount: 0, interimText: "", speechFinalReceived: false },
+      gu: { accumulatedText: "", confidenceSum: 0, confidenceCount: 0, interimText: "", speechFinalReceived: false }
+    };
+
+    let keepAliveInterval = null;
+    let sttReadySent = false;
+
+    function sendInterimUpdate() {
+      let longestLength = -1;
+      let textToShow = "";
+
+      for (const lang of ["en", "hi", "gu"]) {
+        const state = turnState[lang];
+        const currentText = (state.accumulatedText + " " + state.interimText).trim();
+        if (currentText.length > longestLength) {
+          longestLength = currentText.length;
+          textToShow = currentText;
+        }
+      }
+
+      if (textToShow) {
+        safeSend(socket, { type: "interim_transcript", text: textToShow });
+      }
+    }
+
+    let finalAnswerTimeout = null;
+
+    function checkAndTriggerFinalAnswer() {
+      const allFinished = Object.values(turnState).every(s => s.speechFinalReceived);
+      
+      if (allFinished) {
+        if (finalAnswerTimeout) {
+          clearTimeout(finalAnswerTimeout);
+          finalAnswerTimeout = null;
+        }
+        triggerWinner();
+      } else {
+        if (!finalAnswerTimeout) {
+          finalAnswerTimeout = setTimeout(() => {
+            console.log(`[${ts()}] ⏰ Turn timeout reached. Triggering winner based on available transcripts.`);
+            finalAnswerTimeout = null;
+            triggerWinner();
+          }, 250);
+        }
+      }
+    }
+
+    function triggerWinner() {
+      let winnerLang = "en";
+      let maxConfidence = -1;
+      let winnerText = "";
+
+      console.log(`[${ts()}] 📊 Evaluating transcripts for the current turn:`);
+      for (const lang of ["en", "hi", "gu"]) {
+        const state = turnState[lang];
+        const text = state.accumulatedText.trim();
+        const avgConf = state.confidenceCount > 0 ? state.confidenceSum / state.confidenceCount : 0;
+        console.log(`   - [${lang}]: "${text}" (avg conf: ${avgConf.toFixed(3)}, chunks: ${state.confidenceCount})`);
+        
+        if (text && avgConf > maxConfidence) {
+          maxConfidence = avgConf;
+          winnerLang = lang;
+          winnerText = text;
+        }
+      }
+
+      // Reset turn state
+      for (const lang of ["en", "hi", "gu"]) {
+        turnState[lang] = {
+          accumulatedText: "",
+          confidenceSum: 0,
+          confidenceCount: 0,
+          interimText: "",
+          speechFinalReceived: false
+        };
+      }
+
+      if (winnerText) {
+        const now = Date.now();
+        const sttLatency = lastAudioTime ? now - lastAudioTime : 0;
+        console.log(`[${ts()}] 🏆 Winner language: "${winnerLang}" with transcript: "${winnerText}" (STT Latency: ${sttLatency}ms)`);
+        void triggerRagReply(winnerText, null, sttLatency, winnerLang);
+      } else {
+        console.log(`[${ts()}] ⚠️ No non-empty transcripts found for this turn.`);
+      }
+    }
+
+    if (dgKey) {
+      const languages = ["en", "hi", "gu"];
+      
+      languages.forEach((lang) => {
+        const dgQueryParams = new URLSearchParams({
+          model: config.voice.deepgramModel || "nova-3",
+          language: lang,
+          endpointing: "300",
+          interim_results: "true",
+          smart_format: "true",
+          punctuate: "true",
+        });
+        const dgUrl = `wss://api.deepgram.com/v1/listen?${dgQueryParams.toString()}`;
+        console.log(`[${ts()}] 🔌 Connecting to Deepgram [${lang}] Streaming: ${dgUrl}`);
+        
+        const dgWs = new WebSocket(dgUrl, {
+          headers: {
+            Authorization: `Token ${dgKey}`,
+          },
+        });
+        
+        dgSockets[lang].ws = dgWs;
+
+        dgWs.on("open", () => {
+          dgSockets[lang].open = true;
+          console.log(`[${ts()}] 🔌 Deepgram [${lang}] Streaming WS opened`);
+          
+          const buf = dgSockets[lang].buffer;
+          while (buf.length > 0) {
+            const chunk = buf.shift();
+            dgWs.send(chunk);
+          }
+
+          const allOpen = languages.every((l) => dgSockets[l].open);
+          if (allOpen && !sttReadySent) {
+            sttReadySent = true;
+            console.log(`[${ts()}] 🔌 All Deepgram sockets open. Sending stt_ready to client.`);
+            safeSend(socket, { type: "stt_ready" });
+          }
+        });
+
+        dgWs.on("message", (data) => {
+          try {
+            const msg = JSON.parse(data.toString());
+            if (msg.channel && msg.channel.alternatives) {
+              const alternative = msg.channel.alternatives[0];
+              const transcript = alternative.transcript;
+              const confidence = alternative.confidence;
+              const isFinal = msg.is_final;
+              const speechFinal = msg.speech_final;
+
+              if (transcript) {
+                if (isFinal) {
+                  turnState[lang].accumulatedText += (turnState[lang].accumulatedText ? " " : "") + transcript;
+                  turnState[lang].confidenceSum += confidence;
+                  turnState[lang].confidenceCount += 1;
+                  turnState[lang].interimText = "";
+                } else {
+                  turnState[lang].interimText = transcript;
+                }
+              }
+
+              sendInterimUpdate();
+
+              if (speechFinal && isFinal) {
+                turnState[lang].speechFinalReceived = true;
+                console.log(`[${ts()}] 🎙️ Deepgram [${lang}] speech_final received: "${turnState[lang].accumulatedText}" (conf: ${confidence.toFixed(2)})`);
+                checkAndTriggerFinalAnswer();
+              }
+            }
+          } catch (err) {
+            console.error(`Error parsing Deepgram [${lang}] message:`, err);
+          }
+        });
+
+        dgWs.on("error", (err) => {
+          console.error(`[${ts()}] ❌ Deepgram [${lang}] WS error:`, err);
+        });
+
+        dgWs.on("close", (code, reason) => {
+          console.log(`[${ts()}] 🔌 Deepgram [${lang}] WS closed (code: ${code}, reason: ${reason?.toString()})`);
+          dgSockets[lang].open = false;
+        });
+      });
+
+      keepAliveInterval = setInterval(() => {
+        languages.forEach((l) => {
+          const dgWs = dgSockets[l].ws;
+          if (dgWs && dgWs.readyState === WebSocket.OPEN) {
+            dgWs.send(JSON.stringify({ type: "KeepAlive" }));
+          }
+        });
+      }, 3000);
+    } else {
+      console.error(`[${ts()}] ⚠️ DEEPGRAM_API_KEY not configured!`);
+    }
+
+    // ── Greeting ─────────────────────────────────────────────────────────────
+    // Play greeting client-side via a direct HTTP TTS call in startCall()
+    console.log(`[${ts()}] 🤖 Agent  : ${GREETING}`);
 
     /**
      * AbortController for the active reply (LLM stream + TTS chunker).
@@ -67,17 +267,39 @@ export function attachChatSocket(wss, opts) {
     socket.on("close", () => {
       activeReply?.abort();
       activeReply = null;
+      if (finalAnswerTimeout) {
+        clearTimeout(finalAnswerTimeout);
+        finalAnswerTimeout = null;
+      }
+      for (const lang of ["en", "hi", "gu"]) {
+        const dg = dgSockets[lang];
+        if (dg && dg.ws && (dg.ws.readyState === WebSocket.OPEN || dg.ws.readyState === WebSocket.CONNECTING)) {
+          dg.ws.close();
+        }
+      }
+      if (keepAliveInterval) {
+        clearInterval(keepAliveInterval);
+        keepAliveInterval = null;
+      }
       console.log(`[${ts()}] 🔴 Client disconnected (ip: ${ip})\n`);
     });
+
+    let lastAudioTime = 0;
 
     socket.on("message", async (raw, isBinary) => {
       // ── Basic validation ───────────────────────────────────────────────────
       if (isBinary) {
-        safeSend(socket, {
-          type:    "error",
-          code:    "binary_not_supported",
-          message: "Send UTF-8 JSON text only",
-        });
+        lastAudioTime = Date.now();
+        for (const lang of ["en", "hi", "gu"]) {
+          const dg = dgSockets[lang];
+          if (dg && dg.ws) {
+            if (dg.open) {
+              dg.ws.send(raw);
+            } else {
+              dg.buffer.push(raw);
+            }
+          }
+        }
         return;
       }
 
@@ -121,19 +343,42 @@ export function attachChatSocket(wss, opts) {
         return;
       }
 
-      const question = String(body.question ?? "").trim();
-      if (!question) {
-        safeSend(socket, {
-          type:    "error",
-          code:    "question_required",
-          message: 'Include a "question" string',
-        });
+      // Handle interrupt request
+      if (body.type === "interrupt") {
+        console.log(`[${ts()}] ⏹️  Client sent interrupt message`);
+        if (activeReply) {
+          activeReply.abort();
+          activeReply = null;
+        }
+        if (finalAnswerTimeout) {
+          clearTimeout(finalAnswerTimeout);
+          finalAnswerTimeout = null;
+        }
+        // Reset turn state on interrupt
+        for (const lang of ["en", "hi", "gu"]) {
+          turnState[lang] = {
+            accumulatedText: "",
+            confidenceSum: 0,
+            confidenceCount: 0,
+            interimText: "",
+            speechFinalReceived: false
+          };
+        }
         return;
       }
 
-      // ── Interrupt previous reply ───────────────────────────────────────────
-      console.log(`\n[${ts()}] 👤 User   : ${question}`);
+      const question = String(body.question ?? "").trim();
+      if (!question) {
+        // If not a question and not interrupt, just ignore
+        return;
+      }
 
+      // If user typed a question or sent it via JSON, handle it
+      void triggerRagReply(question, body.history);
+    });
+
+    async function triggerRagReply(questionText, clientHistory, sttLatency = 0, winnerLang = null) {
+      const queryStartTime = Date.now();
       if (activeReply) {
         activeReply.abort();
         console.log(`[${ts()}] ⏹️  Interrupted previous reply`);
@@ -147,12 +392,24 @@ export function attachChatSocket(wss, opts) {
       let fullAnswer      = "";
       let capturedSources = null;
 
-      /**
-       * Streaming TTS chunker:
-       *  - Each time it has a sentence/clause chunk ready, it calls Sarvam TTS
-       *  - TTS results are sent in-order as { type: "tts_chunk", chunkId, audio }
-       *  - Concurrent TTS calls overlap with continued LLM streaming
-       */
+      // Detect language: use winnerLang if provided, else run detectLanguage on the text (typed input fallback)
+      const detected = winnerLang || detectLanguage(questionText);
+      const langMap = {
+        gu: "gu-IN",
+        hi: "hi-IN",
+        en: "en-IN"
+      };
+      const targetLanguageCode = langMap[detected] || "en-IN";
+      console.log(`[${ts()}] 🌐 Detected language: "${detected}" -> TTS language: "${targetLanguageCode}"`);
+
+      // Notify the client of the user question with STT latency & queryStartTime
+      safeSend(socket, {
+        type: "user_question",
+        text: questionText,
+        sttLatency,
+        queryStartTime,
+      });
+
       const chunker = createTtsChunker({
         sendFn: (chunkId, b64) => {
           if (socket.readyState === 1 && !signal.aborted) {
@@ -160,15 +417,16 @@ export function attachChatSocket(wss, opts) {
           }
         },
         signal,
+        targetLanguageCode,
       });
 
       console.log(`[${ts()}] 🧠 Initiating streamRagAnswer...`);
 
       try {
-        const history = parseChatHistory(body.history);
+        const history = clientHistory ? parseChatHistory(clientHistory) : [...chatHistory];
 
         await streamRagAnswer(
-          question,
+          questionText,
           (ev) => {
             if (signal.aborted) {
               console.log(`[${ts()}] ⚠️  emit ignored (aborted)`);
@@ -177,13 +435,10 @@ export function attachChatSocket(wss, opts) {
             if (ev.type === "token" && ev.text) {
               fullAnswer += ev.text;
               console.log(`[${ts()}] 📤 Token: "${ev.text}"`);
-              // Send text token for live display in the UI
               safeSend(socket, { type: "token", text: ev.text });
-              // Also feed into the TTS chunker
               chunker.push(ev.text);
             }
             if (ev.type === "done") {
-              // Capture sources — we send done AFTER tts_done (see below)
               capturedSources = ev.sources ?? [];
               console.log(`[${ts()}] 🤖 Agent  : ${fullAnswer}`);
               if (ev.sources?.length) {
@@ -194,18 +449,19 @@ export function attachChatSocket(wss, opts) {
           },
           history,
           signal,
+          detected,
         );
 
-        // Flush any remaining text from the chunker and wait for ALL TTS calls
-        // to complete (i.e. all tts_chunk messages have been sent).
         await chunker.flush();
 
         if (!signal.aborted) {
-          // tts_done tells the client the audio queue is fully populated.
-          // done(sources) finalises the text bubble.
           safeSend(socket, { type: "tts_done" });
           safeSend(socket, { type: "done", sources: capturedSources ?? [] });
           console.log(`[${ts()}] 📤 Sent tts_done + done`);
+
+          // Store in session history
+          chatHistory.push({ role: "user", content: questionText });
+          chatHistory.push({ role: "assistant", content: fullAnswer });
         }
       } catch (err) {
         if (signal.aborted) return;
@@ -227,6 +483,6 @@ export function attachChatSocket(wss, opts) {
       } finally {
         if (activeReply === replyAbort) activeReply = null;
       }
-    });
+    }
   });
 }

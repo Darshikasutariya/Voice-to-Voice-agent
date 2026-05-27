@@ -35,24 +35,22 @@ const MIN_TIMEOUT_CHARS = 15;
  * Creates a streaming text → TTS chunker.
  *
  * Usage:
- *   const chunker = createTtsChunker({ sendFn, signal });
+ *   const chunker = createTtsChunker({ sendFn, signal, targetLanguageCode });
  *   for each LLM token:  chunker.push(tokenText)
  *   when LLM done:       await chunker.flush()
  *
  * @param {{
- *   sendFn: (chunkId: number, base64Audio: string) => void,
- *   signal?: AbortSignal
+ *   sendFn: (chunkId: number, base64Audio: string | null) => void,
+ *   signal?: AbortSignal,
+ *   targetLanguageCode?: string
  * }} opts
  * @returns {{ push: (text: string) => void, flush: () => Promise<void> }}
  */
-export function createTtsChunker({ sendFn, signal }) {
+export function createTtsChunker({ sendFn, signal, targetLanguageCode }) {
   let buffer     = "";
   let nextChunkId = 0;   // ID to assign to the next dispatched chunk
-  let nextSendId  = 0;   // ID of the next chunk to send in-order
 
-  const resolved = new Map(); // chunkId → base64 string | null (null = failed)
   const pending  = [];        // Promise[] — one per dispatched TTS call
-
   let timeoutHandle = null;
   let aborted       = false;
 
@@ -63,23 +61,9 @@ export function createTtsChunker({ sendFn, signal }) {
       aborted = true;
       if (timeoutHandle) { clearTimeout(timeoutHandle); timeoutHandle = null; }
       buffer = "";
-      resolved.clear();
     },
     { once: true },
   );
-
-  // ── In-order drain ────────────────────────────────────────────────────────
-  function drainQueue() {
-    while (resolved.has(nextSendId)) {
-      const audio = resolved.get(nextSendId);
-      resolved.delete(nextSendId);
-      if (audio !== null && !aborted) {
-        console.log(`[${ts()}] [TTS-Chunker] ▶ Sending chunk #${nextSendId}`);
-        try { sendFn(nextSendId, audio); } catch { /* socket may have closed */ }
-      }
-      nextSendId++;
-    }
-  }
 
   // ── Dispatch a TTS call for one text chunk ────────────────────────────────
   function dispatchChunk(text) {
@@ -88,22 +72,22 @@ export function createTtsChunker({ sendFn, signal }) {
 
     const chunkId = nextChunkId++;
     console.log(
-      `[${ts()}] [TTS-Chunker] 🔊 TTS chunk #${chunkId}: "${trimmed.slice(0, 60)}"`,
+      `[${ts()}] [TTS-Chunker] 🔊 Dispatching TTS chunk #${chunkId}: "${trimmed.slice(0, 60)}"`,
     );
 
-    const p = synthesizeSarvamBase64(trimmed)
+    const p = synthesizeSarvamBase64(trimmed, targetLanguageCode, signal)
       .then((b64) => {
         if (aborted) return;
-        resolved.set(chunkId, b64);
-        drainQueue();
+        console.log(`[${ts()}] [TTS-Chunker] ▶ Sending chunk #${chunkId} immediately`);
+        try { sendFn(chunkId, b64); } catch { /* socket may have closed */ }
       })
       .catch((err) => {
+        if (aborted) return;
         console.error(
           `[${ts()}] [TTS-Chunker] ❌ Chunk #${chunkId} failed: ${err.message}`,
         );
-        // Mark null so the queue does not stall waiting for this ID
-        resolved.set(chunkId, null);
-        drainQueue();
+        // Mark null/failed so the client's queue doesn't wait
+        try { sendFn(chunkId, null); } catch { }
       });
 
     pending.push(p);
@@ -114,11 +98,13 @@ export function createTtsChunker({ sendFn, signal }) {
     if (timeoutHandle) { clearTimeout(timeoutHandle); timeoutHandle = null; }
   }
 
+  const TIMEOUT_FLUSH_MS = 200; // 200ms token pause triggers flush
+
   function scheduleTimeout() {
     if (timeoutHandle || aborted) return;
     timeoutHandle = setTimeout(() => {
       timeoutHandle = null;
-      if (buffer.length >= MIN_TIMEOUT_CHARS && !aborted) {
+      if (buffer.trim() && !aborted) {
         console.log(`[${ts()}] [TTS-Chunker] ⏰ Timeout flush: "${buffer.slice(0, 50)}"`);
         dispatchChunk(buffer);
         buffer = "";
@@ -130,11 +116,11 @@ export function createTtsChunker({ sendFn, signal }) {
   function extractChunks() {
     let anyExtracted = false;
     while (!aborted) {
-      // 1. Try a sentence boundary
-      const sm = SENTENCE_END_RE.exec(buffer);
+      // 1. Check for sentence end punctuation: . ! ? । | followed by whitespace or end
+      const sm = /[.!?।|]+['")\]]*(?=\s|$)/.exec(buffer);
       if (sm !== null) {
-        const cutAt = sm.index + sm[0].length; // end of punctuation
-        if (cutAt >= MIN_SENTENCE_CHARS) {
+        const cutAt = sm.index + sm[0].length;
+        if (cutAt >= 6) { // Small sentence chunk
           const chunk = buffer.slice(0, cutAt);
           buffer = buffer.slice(cutAt).trimStart();
           dispatchChunk(chunk);
@@ -143,18 +129,30 @@ export function createTtsChunker({ sendFn, signal }) {
         }
       }
 
-      // 2. Try a clause boundary (only when buffer is long enough)
-      const cm = CLAUSE_END_RE.exec(buffer);
-      if (
-        cm !== null &&
-        buffer.length >= MIN_CLAUSE_CHARS &&
-        cm.index + 1 >= MIN_SENTENCE_CHARS
-      ) {
-        const chunk = buffer.slice(0, cm.index + 1); // include punctuation
-        buffer = buffer.slice(cm.index + cm[0].length).trimStart(); // skip space
-        dispatchChunk(chunk);
-        anyExtracted = true;
-        continue;
+      // 2. Check for clause end punctuation: , ; : — followed by whitespace
+      const cm = /[,;:—]+(?=\s|$)/.exec(buffer);
+      if (cm !== null) {
+        const cutAt = cm.index + cm[0].length;
+        if (cutAt >= 10) { // Medium clause chunk
+          const chunk = buffer.slice(0, cutAt);
+          buffer = buffer.slice(cutAt).trimStart();
+          dispatchChunk(chunk);
+          anyExtracted = true;
+          continue;
+        }
+      }
+
+      // 3. Word threshold: if we have 10 or more words, split at the last space
+      const words = buffer.trim().split(/\s+/);
+      if (words.length >= 10) {
+        const lastSpaceIndex = buffer.lastIndexOf(" ");
+        if (lastSpaceIndex !== -1 && lastSpaceIndex >= 10) {
+          const chunk = buffer.slice(0, lastSpaceIndex);
+          buffer = buffer.slice(lastSpaceIndex).trimStart();
+          dispatchChunk(chunk);
+          anyExtracted = true;
+          continue;
+        }
       }
 
       break;
@@ -169,8 +167,8 @@ export function createTtsChunker({ sendFn, signal }) {
     if (aborted) return;
     buffer += text;
     clearTimer();
-    const extracted = extractChunks();
-    if (!extracted && buffer.length >= MIN_TIMEOUT_CHARS) {
+    extractChunks();
+    if (buffer.trim()) {
       scheduleTimeout();
     }
   }

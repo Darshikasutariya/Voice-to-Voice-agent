@@ -1,4 +1,5 @@
 import { config } from "../config.js";
+import { detectLanguage } from "../utils/langDetect.js";
 
 const SARVAM_TTS_URLS = [
   "https://api.sarvam.ai/text-to-speech",
@@ -10,7 +11,7 @@ const delay = (ms) => new Promise((res) => setTimeout(res, ms));
  * Attempt a single TTS fetch against one URL.
  * Returns { buffer, contentType } on success, throws on failure.
  */
-async function attemptTts(url, body, key) {
+async function attemptTts(url, body, key, signal) {
   const startFetch = Date.now();
   console.log(`[voice/tts] Fetching Sarvam TTS from: ${url}`);
   const res = await fetch(url, {
@@ -20,6 +21,7 @@ async function attemptTts(url, body, key) {
       "Content-Type": "application/json",
     },
     body,
+    signal,
   });
 
   const fetchDuration = Date.now() - startFetch;
@@ -55,7 +57,7 @@ async function attemptTts(url, body, key) {
  * Attempt a single TTS fetch and return the raw base64 string.
  * Used by the streaming chunker to avoid double Buffer encode/decode.
  */
-async function attemptTtsBase64(url, body, key) {
+async function attemptTtsBase64(url, body, key, signal) {
   const startFetch = Date.now();
   const res = await fetch(url, {
     method: "POST",
@@ -64,6 +66,7 @@ async function attemptTtsBase64(url, body, key) {
       "Content-Type": "application/json",
     },
     body,
+    signal,
   });
 
   const fetchDuration = Date.now() - startFetch;
@@ -99,7 +102,7 @@ async function attemptTtsBase64(url, body, key) {
  * @param {string} text
  * @returns {Promise<{ buffer: Buffer, contentType: string }>}
  */
-export async function synthesizeSarvam(text) {
+export async function synthesizeSarvam(text, targetLanguageCode, signal) {
   const startTts = Date.now();
   console.log(`[voice/tts] synthesizeSarvam called for text length: ${text.length} chars`);
 
@@ -110,9 +113,17 @@ export async function synthesizeSarvam(text) {
     });
   }
 
+  const detected = detectLanguage(text);
+  const langMap = {
+    gu: "gu-IN",
+    hi: "hi-IN",
+    en: "en-IN"
+  };
+  const resolvedLang = targetLanguageCode || langMap[detected] || config.voice.sarvamTtsLang;
+
   const body = JSON.stringify({
     text: text.slice(0, 2500),
-    target_language_code: config.voice.sarvamTtsLang,
+    target_language_code: resolvedLang,
     model: config.voice.sarvamTtsModel,
     speaker: config.voice.sarvamTtsSpeaker,
     output_audio_codec: "mp3",
@@ -126,7 +137,7 @@ export async function synthesizeSarvam(text) {
   for (const url of SARVAM_TTS_URLS) {
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
       try {
-        const result = await attemptTts(url, body, key);
+        const result = await attemptTts(url, body, key, signal);
         const totalTtsDuration = Date.now() - startTts;
         console.log(`[voice/tts] synthesizeSarvam completed successfully in ${totalTtsDuration}ms total`);
         return result; // success — return immediately
@@ -161,7 +172,7 @@ export async function synthesizeSarvam(text) {
  * @param {string} text
  * @returns {Promise<string>} base64-encoded MP3 audio
  */
-export async function synthesizeSarvamBase64(text) {
+export async function synthesizeSarvamBase64(text, targetLanguageCode, signal) {
   const startTts = Date.now();
   console.log(`[voice/tts] synthesizeSarvamBase64 called, ${text.length} chars`);
 
@@ -170,9 +181,17 @@ export async function synthesizeSarvamBase64(text) {
     throw Object.assign(new Error("SARVAM_API_KEY not set"), { code: "NO_SARVAM" });
   }
 
+  const detected = detectLanguage(text);
+  const langMap = {
+    gu: "gu-IN",
+    hi: "hi-IN",
+    en: "en-IN"
+  };
+  const resolvedLang = targetLanguageCode || langMap[detected] || config.voice.sarvamTtsLang;
+
   const body = JSON.stringify({
     text: text.slice(0, 2500),
-    target_language_code: config.voice.sarvamTtsLang,
+    target_language_code: resolvedLang,
     model:                 config.voice.sarvamTtsModel,
     speaker:               config.voice.sarvamTtsSpeaker,
     output_audio_codec:    "mp3",
@@ -185,7 +204,7 @@ export async function synthesizeSarvamBase64(text) {
   for (const url of SARVAM_TTS_URLS) {
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
       try {
-        const b64 = await attemptTtsBase64(url, body, key);
+        const b64 = await attemptTtsBase64(url, body, key, signal);
         const dur = Date.now() - startTts;
         console.log(`[voice/tts] synthesizeSarvamBase64 done in ${dur}ms`);
         return b64;

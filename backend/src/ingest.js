@@ -12,6 +12,7 @@ import { config } from "./config.js";
 const args = new Set(process.argv.slice(2));
 const SCRAPE_ONLY = args.has("--scrape-only");
 const USE_CACHE = args.has("--use-cache"); // reuse data/scraped.json if present
+const CHUNK_ONLY = args.has("--chunk-only"); // chunk + preview, no embedding
 
 /* ─── Step 1 ─ scrape (or load from cache) ─────────────────── */
 
@@ -52,8 +53,56 @@ async function step2ResetCollection() {
 
 /* ─── Step 3 ─ chunk + embed + upsert ──────────────────────── */
 
+/**
+ * Print a few representative chunks so you can verify cleaning worked
+ * before spending time on the embed step.
+ */
+function previewChunks(chunks) {
+  if (chunks.length === 0) return;
+
+  console.log("\n[preview] sample chunks (first 3):");
+  console.log("─".repeat(60));
+
+  const sample = chunks.slice(0, 3);
+  for (const c of sample) {
+    console.log(`  id        : ${c.id}`);
+    console.log(`  title     : ${c.metadata.title}`);
+    console.log(`  module    : ${c.metadata.module}`);
+    console.log(`  priority  : ${c.metadata.priority}`);
+    console.log(`  type      : ${c.metadata.type}`);
+    console.log(`  intent    : ${c.metadata.intent}`);
+    console.log(`  length    : ${c.metadata.cleanedLength} chars`);
+    console.log(`  text      : ${c.text.slice(0, 180).replace(/\s+/g, " ")}...`);
+    console.log("─".repeat(60));
+  }
+
+  // Also show priority distribution
+  const priorityStats = {};
+  const typeStats = {};
+  for (const c of chunks) {
+    priorityStats[c.metadata.priority] = (priorityStats[c.metadata.priority] || 0) + 1;
+    typeStats[c.metadata.type] = (typeStats[c.metadata.type] || 0) + 1;
+  }
+  console.log(`[preview] priority distribution:`, priorityStats);
+  console.log(`[preview] type distribution    :`, typeStats);
+  console.log("");
+}
+
 async function step3Embed(pages) {
   const chunks = await chunkDocuments(pages);
+
+  if (chunks.length === 0) {
+    console.error("[step3] no chunks produced after cleaning. Check your scraped data.");
+    process.exit(1);
+  }
+
+  previewChunks(chunks);
+
+  if (CHUNK_ONLY) {
+    console.log("[step3] --chunk-only flag set, stopping before embedding.");
+    console.log(`[step3] would have embedded ${chunks.length} chunks.`);
+    return;
+  }
 
   const docs = chunks.map(
     (c) => new Document({ pageContent: c.text, metadata: c.metadata }),
@@ -92,6 +141,8 @@ async function step3Embed(pages) {
       `[step3] chroma upsert ${Math.min(i + BATCH, docs.length)}/${docs.length}`,
     );
   }
+
+  return chunks;
 }
 
 /* ─── main ────────────────────────────────────────────────── */
@@ -121,15 +172,22 @@ async function main() {
   }
 
   console.log("");
-  await step2ResetCollection();
-  console.log("");
-  await step3Embed(pages);
+  if (!CHUNK_ONLY) {
+    await step2ResetCollection();
+    console.log("");
+  }
+
+  const chunks = await step3Embed(pages);
 
   console.log("\n════════════════════════════════════════");
   console.log("  Ingest complete                       ");
   console.log("════════════════════════════════════════");
-  console.log(`Collection: ${config.chroma.collection}`);
-  console.log(`Chroma URL: ${config.chroma.url}`);
+  if (chunks) {
+    console.log(`Total chunks   : ${chunks.length}`);
+  }
+  console.log(`Collection     : ${config.chroma.collection}`);
+  console.log(`Chroma URL     : ${config.chroma.url}`);
+  console.log(`Embedding model: ${config.embed.modelId}`);
   console.log(`\nTry: npm run query -- "how do I sync Vyapar with Tally"`);
 }
 

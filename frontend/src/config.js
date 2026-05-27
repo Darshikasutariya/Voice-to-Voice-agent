@@ -16,6 +16,7 @@ export function buildWsChatUrl() {
   const wsProto = backend.protocol === 'https:' ? 'wss:' : 'ws:'
   const u = new URL('/ws/chat', `${wsProto}//${backend.host}`)
   if (chatApiKey) u.searchParams.set('apiKey', chatApiKey)
+  u.searchParams.set('language', 'multi')
   return u.href
 }
 

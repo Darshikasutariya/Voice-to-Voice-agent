@@ -8,9 +8,6 @@ import {
 
 /** @typedef {'idle' | 'active' | 'listening' | 'thinking' | 'speaking'} Phase */
 
-const SpeechRecognitionAPI =
-  window.SpeechRecognition || window.webkitSpeechRecognition || null
-
 function logTime(msg) {
   const d = new Date()
   const ts = `${d.toLocaleTimeString("en-IN", { hour12: false })}.${String(d.getMilliseconds()).padStart(3, '0')}`
@@ -20,7 +17,7 @@ function logTime(msg) {
 /** Decode a base64 string into an ArrayBuffer for Web AudioContext */
 function base64ToArrayBuffer(b64) {
   const binStr = atob(b64)
-  const bytes  = new Uint8Array(binStr.length)
+  const bytes = new Uint8Array(binStr.length)
   for (let i = 0; i < binStr.length; i++) bytes[i] = binStr.charCodeAt(i)
   return bytes.buffer
 }
@@ -33,7 +30,7 @@ function base64ToArrayBuffer(b64) {
  *  - 60 fps rAF → 5 frames ≈ 83 ms latency (well under the 300 ms target)
  */
 const VAD_THRESHOLD = 40   // 0-255 — raise if too sensitive to background noise (increased from 20)
-const VAD_FRAMES    = 10   // consecutive loud frames required before barge-in (increased from 5 to ~160ms)
+const VAD_FRAMES = 10   // consecutive loud frames required before barge-in (increased from 5 to ~160ms)
 
 function buildHistoryPayload(messages) {
   return messages
@@ -48,47 +45,57 @@ function buildHistoryPayload(messages) {
 }
 
 export default function App() {
-  const [messages, setMessages]     = useState([])
-  const [phase, setPhase]           = useState(/** @type {Phase} */ ('idle'))
-  const [wsReady, setWsReady]       = useState(false)
-  const [wsError, setWsError]       = useState('')
+  const [messages, setMessages] = useState([])
+  const [phase, setPhase] = useState(/** @type {Phase} */('idle'))
+  const [wsReady, setWsReady] = useState(false)
+  const [wsError, setWsError] = useState('')
   const [statusLine, setStatusLine] = useState('')
   const [interimText, setInterimText] = useState('')
-  const [isMuted, setIsMuted]       = useState(false)
+  const [isMuted, setIsMuted] = useState(false)
 
   // ── Core refs ────────────────────────────────────────────────────────────
-  const wsRef              = useRef(null)
-  const assistantDraftRef  = useRef('')
-  const messagesRef        = useRef([])
-  const playRef            = useRef(/** @type {HTMLAudioElement | null} */ (null))
-  const playUrlRef         = useRef(/** @type {string | null} */ (null))
-  const recognitionRef     = useRef(/** @type {InstanceType<typeof SpeechRecognitionAPI> | null} */ (null))
-  const phaseRef           = useRef(/** @type {Phase} */ ('idle'))
-  const isListeningRef     = useRef(false)
-  const mutedRef           = useRef(false)
+  const wsRef = useRef(null)
+  const assistantDraftRef = useRef('')
+  const messagesRef = useRef([])
+  const playRef = useRef(/** @type {HTMLAudioElement | null} */(null))
+  const playUrlRef = useRef(/** @type {string | null} */(null))
+  const micStreamRef = useRef(null)
+  const mediaRecorderRef = useRef(null)
+  const phaseRef = useRef(/** @type {Phase} */('idle'))
+  const isListeningRef = useRef(false)
+  const mutedRef = useRef(false)
   /** Set to true once user clicks "Call support" */
-  const callStartedRef     = useRef(false)
+  const callStartedRef = useRef(false)
   /** Bumped on interrupt / new question — invalidates stale WS tokens + TTS */
-  const replyEpochRef      = useRef(0)
+  const replyEpochRef = useRef(0)
   /** Id of the in-flight WS reply */
-  const activeReplyIdRef   = useRef(0)
-  const playbackEpochRef   = useRef(0)
-  const speakingStartRef   = useRef(0)
+  const activeReplyIdRef = useRef(0)
+  const playbackEpochRef = useRef(0)
+  const speakingStartRef = useRef(0)
 
   // ── Streaming audio queue (AudioContext-based) ─────────────────────────────
-  const audioCtxRef       = useRef(/** @type {AudioContext | null} */ (null))
-  const audioNodesRef     = useRef(/** @type {AudioBufferSourceNode[]} */ ([]))
-  const nextAudioTimeRef  = useRef(0)            // ctx.currentTime for next chunk
-  const ttsStreamDoneRef  = useRef(false)        // true after tts_done received
-  const pendingChunksRef  = useRef(0)            // chunks in decode/play pipeline
-  const decodingChainRef  = useRef(Promise.resolve()) // serialise decodeAudioData
+  const audioCtxRef = useRef(/** @type {AudioContext | null} */(null))
+  const audioNodesRef = useRef(/** @type {AudioBufferSourceNode[]} */([]))
+  const nextAudioTimeRef = useRef(0)            // ctx.currentTime for next chunk
+  const ttsStreamDoneRef = useRef(false)        // true after tts_done received
+  const pendingChunksRef = useRef(0)            // chunks in decode/play pipeline
   const ttsChunksCountRef = useRef(0)            // tts_chunk count this reply
+  const playQueueRef = useRef({
+    nextPlayId: 0,
+    decodedChunks: new Map(),
+    isPlaying: false,
+  })
+  const sttReadyRef = useRef(false)
+  const queryStartTimeRef = useRef(0)
+  const firstTokenLoggedRef = useRef(false)
+  const firstAudioChunkLoggedRef = useRef(false)
+  const firstAudioPlayLoggedRef = useRef(false)
 
   // ── VAD refs ─────────────────────────────────────────────────────────────
-  const vadStreamRef      = useRef(/** @type {MediaStream | null} */ (null))
-  const vadContextRef     = useRef(/** @type {AudioContext | null} */ (null))
-  const vadRafRef         = useRef(/** @type {number | null} */ (null))
-  const vadLoudFrames     = useRef(0)
+  const vadStreamRef = useRef(/** @type {MediaStream | null} */(null))
+  const vadContextRef = useRef(/** @type {AudioContext | null} */(null))
+  const vadRafRef = useRef(/** @type {number | null} */(null))
+  const vadLoudFrames = useRef(0)
 
   useEffect(() => {
     messagesRef.current = messages
@@ -104,9 +111,9 @@ export default function App() {
   // ── Stop TTS / playback and invalidate in-flight reply ───────────────────
   const stopAgentOutput = useCallback(() => {
     logTime(`[stopAgentOutput] Stopping. epoch→${replyEpochRef.current + 1}`)
-    replyEpochRef.current    += 1
+    replyEpochRef.current += 1
     playbackEpochRef.current += 1
-    speakingStartRef.current  = 0
+    speakingStartRef.current = 0
     assistantDraftRef.current = ''
     window.speechSynthesis?.cancel()
     if (playRef.current) {
@@ -120,15 +127,19 @@ export default function App() {
     }
     // Stop all streamed AudioContext source nodes
     audioNodesRef.current.forEach((src) => {
-      try { src.stop() } catch {}
-      try { src.disconnect() } catch {}
+      try { src.stop() } catch { }
+      try { src.disconnect() } catch { }
     })
-    audioNodesRef.current     = []
-    nextAudioTimeRef.current  = 0
-    ttsStreamDoneRef.current  = false
-    pendingChunksRef.current  = 0
+    audioNodesRef.current = []
+    nextAudioTimeRef.current = 0
+    ttsStreamDoneRef.current = false
+    pendingChunksRef.current = 0
     ttsChunksCountRef.current = 0
-    decodingChainRef.current  = Promise.resolve()
+    playQueueRef.current = {
+      nextPlayId: 0,
+      decodedChunks: new Map(),
+      isPlaying: false,
+    }
   }, [])
 
   // ── Drop incomplete streaming assistant bubble after interrupt ────────────
@@ -143,37 +154,22 @@ export default function App() {
     })
   }, [])
 
-  // ── Start SpeechRecognition ───────────────────────────────────────────────
+  // ── Start SpeechRecognition Dummy / Phase Update ──────────────────────────
   const startListening = useCallback(() => {
     if (mutedRef.current) {
-      logTime(`[startListening] Skipped starting SpeechRecognition because mic is muted.`)
-      return
-    }
-    const rec = recognitionRef.current
-    if (!rec) {
-      logTime(`[startListening] Skipped starting SpeechRecognition because recognitionRef.current is null.`)
-      return
-    }
-    if (isListeningRef.current) {
-      logTime(`[startListening] Skipped starting SpeechRecognition because it is already listening (isListeningRef=true).`)
+      logTime(`[startListening] Skipped starting because mic is muted.`)
       return
     }
     if (phaseRef.current === 'idle') {
-      logTime(`[startListening] Skipped starting SpeechRecognition because phase is idle.`)
+      logTime(`[startListening] Skipped starting because phase is idle.`)
       return
     }
-    try {
-      logTime(`[startListening] Calling SpeechRecognition.start()...`)
-      rec.start()
-      isListeningRef.current = true
-      if (phaseRef.current !== 'thinking') {
-        updatePhase('listening')
-      }
-      setInterimText('')
-      setStatusLine('')
-    } catch (err) {
-      logTime(`[startListening] SpeechRecognition.start() threw: ${err.message || err} (already running/starting).`)
+    logTime(`[startListening] Listening active...`)
+    if (phaseRef.current !== 'thinking' && phaseRef.current !== 'speaking') {
+      updatePhase('listening')
     }
+    setInterimText('')
+    setStatusLine('')
   }, [updatePhase])
 
   // ── VAD: stop ────────────────────────────────────────────────────────────
@@ -182,97 +178,81 @@ export default function App() {
       cancelAnimationFrame(vadRafRef.current)
       vadRafRef.current = null
     }
-    if (vadContextRef.current) {
-      vadContextRef.current.close().catch(() => {})
-      vadContextRef.current = null
-    }
-    if (vadStreamRef.current) {
-      vadStreamRef.current.getTracks().forEach((t) => t.stop())
-      vadStreamRef.current = null
-    }
+    // Note: vadContextRef is kept alive here and closed only inside endCall
+    vadStreamRef.current = null
     vadLoudFrames.current = 0
   }, [])
 
   // ── VAD: start — always-on AudioContext analyser polling loop ────────────
   const startVAD = useCallback(
-    (bargeInFn) => {
+    (stream, bargeInFn) => {
       stopVAD()
-      navigator.mediaDevices
-        .getUserMedia({
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-          },
-          video: false,
-        })
-        .then((stream) => {
-          vadStreamRef.current = stream
+      vadStreamRef.current = stream
 
-          const ctx = new AudioContext()
-          vadContextRef.current = ctx
+      if (!vadContextRef.current || vadContextRef.current.state === 'closed') {
+        vadContextRef.current = new (window.AudioContext || window.webkitAudioContext)()
+      }
+      if (vadContextRef.current.state === 'suspended') {
+        vadContextRef.current.resume().catch(() => { })
+      }
+      const ctx = vadContextRef.current
 
-          const analyser = ctx.createAnalyser()
-          analyser.fftSize = 256  // 128 frequency bins — fast & sufficient
+      const analyser = ctx.createAnalyser()
+      analyser.fftSize = 256  // 128 frequency bins — fast & sufficient
 
-          const src = ctx.createMediaStreamSource(stream)
-          src.connect(analyser)   // NOT connected to destination → no echo
+      const src = ctx.createMediaStreamSource(stream)
+      src.connect(analyser)   // NOT connected to destination → no echo
 
-          const buf = new Uint8Array(analyser.frequencyBinCount)
+      const buf = new Uint8Array(analyser.frequencyBinCount)
 
-          function tick() {
-            analyser.getByteFrequencyData(buf)
+      function tick() {
+        analyser.getByteFrequencyData(buf)
 
-            // Average energy across all frequency bins (0-255 scale)
-            let sum = 0
-            for (let i = 0; i < buf.length; i++) sum += buf[i]
-            const rms = sum / buf.length
+        // Average energy across all frequency bins (0-255 scale)
+        let sum = 0
+        for (let i = 0; i < buf.length; i++) sum += buf[i]
+        const rms = sum / buf.length
 
-            const p = phaseRef.current
-            const now = Date.now()
-            const timeSinceSpeakingStart = speakingStartRef.current ? now - speakingStartRef.current : 0
-            const isRefractory = p === 'speaking' && (!speakingStartRef.current || timeSinceSpeakingStart <= 1000)
+        const p = phaseRef.current
+        const now = Date.now()
+        const timeSinceSpeakingStart = speakingStartRef.current ? now - speakingStartRef.current : 0
+        const isRefractory = p === 'speaking' && (!speakingStartRef.current || timeSinceSpeakingStart <= 1000)
 
-            const shouldDetect =
-              !mutedRef.current &&
-              rms > VAD_THRESHOLD &&
-              p === 'speaking' &&
-              !isRefractory
+        const shouldDetect =
+          !mutedRef.current &&
+          rms > VAD_THRESHOLD &&
+          p === 'speaking' &&
+          !isRefractory
 
-            if (rms > VAD_THRESHOLD && !mutedRef.current) {
-              if (p === 'thinking' || p === 'speaking') {
-                if (shouldDetect) {
-                  vadLoudFrames.current += 1
-                  logTime(`[VAD] Sound detected above threshold (${rms.toFixed(1)} > ${VAD_THRESHOLD}) while speaking. Loud frame count: ${vadLoudFrames.current}/${VAD_FRAMES}`)
-                  if (vadLoudFrames.current >= VAD_FRAMES) {
-                    logTime(`[VAD] Loud frames threshold met. Triggering barge-in callback.`)
-                    vadLoudFrames.current = 0
-                    bargeInFn()
-                  }
-                } else {
-                  if (isRefractory) {
-                    logTime(`[VAD] Ignored sound (${rms.toFixed(1)} > ${VAD_THRESHOLD}) during speaking refractory period (${timeSinceSpeakingStart}ms)`)
-                  } else {
-                    logTime(`[VAD] Ignored sound (${rms.toFixed(1)} > ${VAD_THRESHOLD}) during phase: "${p}"`)
-                  }
-                  vadLoudFrames.current = 0
-                }
-              } else {
+        if (rms > VAD_THRESHOLD && !mutedRef.current) {
+          if (p === 'thinking' || p === 'speaking') {
+            if (shouldDetect) {
+              vadLoudFrames.current += 1
+              logTime(`[VAD] Sound detected above threshold (${rms.toFixed(1)} > ${VAD_THRESHOLD}) while speaking. Loud frame count: ${vadLoudFrames.current}/${VAD_FRAMES}`)
+              if (vadLoudFrames.current >= VAD_FRAMES) {
+                logTime(`[VAD] Loud frames threshold met. Triggering barge-in callback.`)
                 vadLoudFrames.current = 0
+                bargeInFn()
               }
             } else {
+              if (isRefractory) {
+                logTime(`[VAD] Ignored sound (${rms.toFixed(1)} > ${VAD_THRESHOLD}) during speaking refractory period (${timeSinceSpeakingStart}ms)`)
+              } else {
+                logTime(`[VAD] Ignored sound (${rms.toFixed(1)} > ${VAD_THRESHOLD}) during phase: "${p}"`)
+              }
               vadLoudFrames.current = 0
             }
-
-            vadRafRef.current = requestAnimationFrame(tick)
+          } else {
+            vadLoudFrames.current = 0
           }
+        } else {
+          vadLoudFrames.current = 0
+        }
 
-          vadRafRef.current = requestAnimationFrame(tick)
-        })
-        .catch(() => {
-          // Mic denied or not available — VAD silently disabled; user can still
-          // tap to interrupt via the stop agent output path.
-        })
+        vadRafRef.current = requestAnimationFrame(tick)
+      }
+
+      vadRafRef.current = requestAnimationFrame(tick)
     },
     [stopVAD],
   )
@@ -283,11 +263,14 @@ export default function App() {
     mutedRef.current = nowMuted
     setIsMuted(nowMuted)
 
+    if (micStreamRef.current) {
+      micStreamRef.current.getAudioTracks().forEach((track) => {
+        track.enabled = !nowMuted
+      })
+      logTime(`[toggleMute] Microphone tracks enabled: ${!nowMuted}`)
+    }
+
     if (nowMuted) {
-      const rec = recognitionRef.current
-      if (rec && isListeningRef.current) {
-        try { rec.stop(); } catch { /* ignore */ }
-      }
       isListeningRef.current = false
       setInterimText('')
       if (phaseRef.current === 'listening') {
@@ -380,7 +363,6 @@ export default function App() {
       }
 
       // VAD (AudioContext) stays running so it can still detect barge-in.
-      const rec = recognitionRef.current
 
       const onDone = () => {
         if (playEpoch !== playbackEpochRef.current) {
@@ -402,22 +384,23 @@ export default function App() {
       const fallbackSpeak = () => {
         if (playEpoch !== playbackEpochRef.current) return
         logTime(`[playAgentReply] Triggering browser SpeechSynthesis fallback...`)
-        
+
         updatePhase('speaking')
         speakingStartRef.current = 0
-        if (rec && isListeningRef.current) {
-          logTime(`[playAgentReply] Stopping SpeechRecognition to prevent echo feedback.`)
-          try { rec.stop(); } catch { /* ignore */ }
-          isListeningRef.current = false
-        }
 
         window.speechSynthesis?.cancel()
         const utt = new SpeechSynthesisUtterance(t)
-        utt.lang  = 'en-IN'
-        utt.rate  = 1.02
+        const det = detectLanguage(t)
+        const langMap = {
+          gu: 'gu-IN',
+          hi: 'hi-IN',
+          en: 'en-IN'
+        }
+        utt.lang = langMap[det] || 'en-IN'
+        utt.rate = 1.02
         utt.onstart = () => {
           speakingStartRef.current = Date.now()
-          logTime(`[playAgentReply] Fallback SpeechSynthesis started. Refractory period started.`)
+          logTime(`[playAgentReply] Fallback SpeechSynthesis started (${utt.lang}). Refractory period started.`)
         }
         utt.onend = () => {
           logTime(`[playAgentReply] Fallback SpeechSynthesis completed.`)
@@ -447,15 +430,10 @@ export default function App() {
 
         updatePhase('speaking')
         speakingStartRef.current = 0
-        if (rec && isListeningRef.current) {
-          logTime(`[playAgentReply] Stopping SpeechRecognition to prevent echo feedback.`)
-          try { rec.stop(); } catch { /* ignore */ }
-          isListeningRef.current = false
-        }
 
         const url = URL.createObjectURL(blob)
         playUrlRef.current = url
-        const a  = new Audio(url)
+        const a = new Audio(url)
         playRef.current = a
         a.onplaying = () => {
           speakingStartRef.current = Date.now()
@@ -492,75 +470,47 @@ export default function App() {
     }, 300)
   }, [updatePhase, startListening])
 
-  // ── Audio queue: decode & schedule one TTS chunk ─────────────────────────
-  const enqueueAudioChunk = useCallback((base64, chunkId, replyId) => {
+  const triggerPlayback = useCallback((replyId) => {
     if (replyId !== activeReplyIdRef.current) return
 
-    // Lazy-create or reuse the AudioContext for this call session
-    if (!audioCtxRef.current || audioCtxRef.current.state === 'closed') {
-      audioCtxRef.current = new AudioContext()
-      nextAudioTimeRef.current = 0
-    }
-    if (audioCtxRef.current.state === 'suspended') {
-      audioCtxRef.current.resume().catch(() => {})
-    }
+    const ctx = audioCtxRef.current
+    if (!ctx || ctx.state === 'closed') return
 
-    // Serialise decoding so chunks are scheduled in arrival order
-    decodingChainRef.current = decodingChainRef.current.then(async () => {
-      // Stale check after potential async gap
-      if (replyId !== activeReplyIdRef.current) {
+    const q = playQueueRef.current
+    while (q.decodedChunks.has(q.nextPlayId)) {
+      const chunkId = q.nextPlayId
+      const buffer = q.decodedChunks.get(chunkId)
+      q.nextPlayId++
+
+      if (buffer === null) {
+        logTime(`[AudioQueue] Skipping failed chunk #${chunkId}`)
         pendingChunksRef.current = Math.max(0, pendingChunksRef.current - 1)
         checkAudioPlaybackDone(replyId)
-        return
-      }
-      const ctx = audioCtxRef.current
-      if (!ctx || ctx.state === 'closed') {
-        pendingChunksRef.current = Math.max(0, pendingChunksRef.current - 1)
-        checkAudioPlaybackDone(replyId)
-        return
-      }
-
-      // Decode base64 → AudioBuffer
-      let audioBuffer
-      try {
-        const ab = base64ToArrayBuffer(base64)
-        audioBuffer = await ctx.decodeAudioData(ab)
-      } catch (err) {
-        logTime(`[AudioQueue] ❌ Decode failed #${chunkId}: ${err.message || err}`)
-        pendingChunksRef.current = Math.max(0, pendingChunksRef.current - 1)
-        checkAudioPlaybackDone(replyId)
-        return
-      }
-
-      // Stale check again after the async decode
-      if (replyId !== activeReplyIdRef.current) {
-        pendingChunksRef.current = Math.max(0, pendingChunksRef.current - 1)
-        return
+        continue
       }
 
       // Schedule playback — seamlessly after previous chunk
-      const isFirstChunk        = nextAudioTimeRef.current === 0
-      const now                 = ctx.currentTime
-      const startAt             = Math.max(nextAudioTimeRef.current, now + 0.04)
-      nextAudioTimeRef.current  = startAt + audioBuffer.duration
+      const isFirstChunk = nextAudioTimeRef.current === 0
+      const now = ctx.currentTime
+      const startAt = Math.max(nextAudioTimeRef.current, now + 0.04)
+      nextAudioTimeRef.current = startAt + buffer.duration
 
       const src = ctx.createBufferSource()
-      src.buffer = audioBuffer
+      src.buffer = buffer
       src.connect(ctx.destination)
       audioNodesRef.current.push(src)
       src.start(startAt)
-      logTime(`[AudioQueue] ▶ Chunk #${chunkId} @ +${(startAt - now).toFixed(3)}s, dur=${audioBuffer.duration.toFixed(2)}s`)
+      logTime(`[AudioQueue] ▶ Chunk #${chunkId} scheduled @ +${(startAt - now).toFixed(3)}s, dur=${buffer.duration.toFixed(2)}s`)
 
       if (isFirstChunk) {
+        if (!firstAudioPlayLoggedRef.current && queryStartTimeRef.current > 0) {
+          firstAudioPlayLoggedRef.current = true
+          const lat = Date.now() - queryStartTimeRef.current
+          console.log(`[Metrics] 🔊 First Audio Play Latency: ${lat}ms`)
+        }
         // Transition to speaking phase when first audio byte is about to play
         updatePhase('speaking')
         speakingStartRef.current = 0
-        // Stop SpeechRecognition to prevent microphone echo feedback
-        const rec = recognitionRef.current
-        if (rec && isListeningRef.current) {
-          try { rec.stop() } catch {}
-          isListeningRef.current = false
-        }
         // Set refractory timestamp exactly when audio starts emitting
         const msUntilPlay = Math.max(0, (startAt - now) * 1000)
         setTimeout(() => {
@@ -577,8 +527,54 @@ export default function App() {
         logTime(`[AudioQueue] Chunk #${chunkId} ended. pending=${pendingChunksRef.current}`)
         checkAudioPlaybackDone(replyId)
       }
-    })
+    }
   }, [updatePhase, checkAudioPlaybackDone])
+
+  // ── Audio queue: decode & schedule one TTS chunk ─────────────────────────
+  const enqueueAudioChunk = useCallback((base64, chunkId, replyId) => {
+    if (replyId !== activeReplyIdRef.current) return
+
+    // Lazy-create or reuse the AudioContext for this call session
+    if (!audioCtxRef.current || audioCtxRef.current.state === 'closed') {
+      audioCtxRef.current = new AudioContext()
+      nextAudioTimeRef.current = 0
+    }
+    if (audioCtxRef.current.state === 'suspended') {
+      audioCtxRef.current.resume().catch(() => { })
+    }
+
+    const ctx = audioCtxRef.current
+    if (base64 === null) {
+      playQueueRef.current.decodedChunks.set(chunkId, null)
+      triggerPlayback(replyId)
+      return
+    }
+
+    // Decode base64 → ArrayBuffer, then decodeAudioData asynchronously in parallel
+    let ab
+    try {
+      ab = base64ToArrayBuffer(base64)
+    } catch (err) {
+      logTime(`[AudioQueue] ❌ Base64 decode failed #${chunkId}: ${err.message || err}`)
+      playQueueRef.current.decodedChunks.set(chunkId, null)
+      triggerPlayback(replyId)
+      return
+    }
+
+    ctx.decodeAudioData(ab)
+      .then((audioBuffer) => {
+        if (replyId !== activeReplyIdRef.current) return
+        playQueueRef.current.decodedChunks.set(chunkId, audioBuffer)
+        triggerPlayback(replyId)
+      })
+      .catch((err) => {
+        logTime(`[AudioQueue] ❌ AudioContext decode failed #${chunkId}: ${err.message || err}`)
+        if (replyId === activeReplyIdRef.current) {
+          playQueueRef.current.decodedChunks.set(chunkId, null)
+          triggerPlayback(replyId)
+        }
+      })
+  }, [triggerPlayback])
 
   // ── Audio queue: tts_done signal from backend ────────────────────────────
   const handleTtsStreamDone = useCallback((replyId) => {
@@ -597,10 +593,20 @@ export default function App() {
     let ws = null
 
     function handleMessage(ev) {
-      if (!callStartedRef.current) return
-
       let data
       try { data = JSON.parse(ev.data) } catch { return }
+
+      if (data.type === 'stt_ready') {
+        logTime(`[WS] Received stt_ready.`)
+        sttReadyRef.current = true
+        if (callStartedRef.current && mediaRecorderRef.current && mediaRecorderRef.current.state === 'inactive') {
+          logTime(`[WS] Starting MediaRecorder since call is active.`)
+          mediaRecorderRef.current.start(250)
+        }
+        return
+      }
+
+      if (!callStartedRef.current) return
 
       const isStaleReply = () => {
         const stale = activeReplyIdRef.current === 0 ||
@@ -611,10 +617,50 @@ export default function App() {
         return stale
       }
 
+      // ── Interim result or building transcript from Deepgram ────────────────
+      if (data.type === 'interim_transcript') {
+        setInterimText(data.text)
+        return
+      }
+
+      // ── Finalized transcript trigger ───────────────────────────────────────
+      if (data.type === 'user_question') {
+        logTime(`[WS] Received user_question: "${data.text}"`)
+        stopAgentOutput()
+        activeReplyIdRef.current = replyEpochRef.current
+        pruneInterruptedAssistant()
+        setInterimText('')
+        setStatusLine('')
+        updatePhase('thinking')
+
+        queryStartTimeRef.current = data.queryStartTime || Date.now()
+        firstTokenLoggedRef.current = false
+        firstAudioChunkLoggedRef.current = false
+        firstAudioPlayLoggedRef.current = false
+
+        if (data.sttLatency) {
+          console.log(`[Metrics] 🎙️ STT Latency (deepgram endpointing): ${data.sttLatency}ms`)
+        }
+
+        setMessages((prev) => [
+          ...prev,
+          { role: 'user', content: data.text },
+          { role: 'assistant', content: '', streaming: true, sources: [] },
+        ])
+        return
+      }
+
       // ── Streaming audio chunk from backend TTS chunker ───────────────────
-      if (data.type === 'tts_chunk' && data.audio) {
-        logTime(`[WS] tts_chunk #${data.chunkId ?? 0} received`)
+      if (data.type === 'tts_chunk') {
+        logTime(`[WS] tts_chunk #${data.chunkId ?? 0} received (hasAudio: ${!!data.audio})`)
         if (isStaleReply()) return
+
+        if (!firstAudioChunkLoggedRef.current && queryStartTimeRef.current > 0) {
+          firstAudioChunkLoggedRef.current = true
+          const lat = Date.now() - queryStartTimeRef.current
+          console.log(`[Metrics] 📤 Audio Send Latency (first TTS chunk received): ${lat}ms`)
+        }
+
         ttsChunksCountRef.current++
         pendingChunksRef.current++
         enqueueAudioChunk(data.audio, data.chunkId ?? 0, activeReplyIdRef.current)
@@ -632,6 +678,13 @@ export default function App() {
       if (data.type === 'token' && data.text) {
         logTime(`[WebSocket handleMessage] Received token: "${data.text}"`)
         if (isStaleReply()) return
+
+        if (!firstTokenLoggedRef.current && queryStartTimeRef.current > 0) {
+          firstTokenLoggedRef.current = true
+          const lat = Date.now() - queryStartTimeRef.current
+          console.log(`[Metrics] 🧠 LLM First Token Latency: ${lat}ms`)
+        }
+
         assistantDraftRef.current += data.text
         updatePhase('thinking')
         setMessages((prev) => {
@@ -648,7 +701,7 @@ export default function App() {
       if (data.type === 'done') {
         logTime(`[WebSocket handleMessage] Received "done" event. sourcesCount=${data.sources?.length ?? 0}`)
         if (isStaleReply()) return
-        const full    = assistantDraftRef.current
+        const full = assistantDraftRef.current
         const replyId = activeReplyIdRef.current
         assistantDraftRef.current = ''
         setMessages((prev) => {
@@ -711,11 +764,15 @@ export default function App() {
       reconnectTimer = null
       ws = new WebSocket(url)
       wsRef.current = ws
-      ws.onopen  = () => { attempt = 0; setWsReady(true); setWsError('') }
+      ws.onopen = () => { attempt = 0; setWsReady(true); setWsError('') }
       ws.onmessage = handleMessage
-      ws.onerror = () => setWsError('WebSocket error — is the backend running?')
+      ws.onerror = () => {
+        setWsError('WebSocket error — is the backend running?')
+        sttReadyRef.current = false
+      }
       ws.onclose = () => {
         setWsReady(false)
+        sttReadyRef.current = false
         wsRef.current = null
         if (shouldReconnect.current) scheduleReconnect()
       }
@@ -732,89 +789,117 @@ export default function App() {
 
   // ── Start call ───────────────────────────────────────────────────────────
   const startCall = useCallback(() => {
-    if (!SpeechRecognitionAPI) {
-      updatePhase('active')
-      setStatusLine('Speech recognition is not supported in this browser. Please use Chrome.')
-      return
+    logTime(`[startCall] Requesting microphone access...`)
+
+    // Create/Resume AudioContexts synchronously inside user gesture!
+    if (!audioCtxRef.current || audioCtxRef.current.state === 'closed') {
+      audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)()
+      nextAudioTimeRef.current = 0
+    }
+    if (audioCtxRef.current.state === 'suspended') {
+      audioCtxRef.current.resume().catch((err) => {
+        logTime(`[startCall] Failed to resume AudioContext: ${err.message}`)
+      })
     }
 
-    const rec = new SpeechRecognitionAPI()
-    rec.lang           = 'en-IN'
-    rec.continuous     = false   // fire one result per utterance
-    rec.interimResults = true    // live transcription
-
-    rec.onresult = (e) => {
-      const results = Array.from(e.results)
-      const interim = results
-        .filter((r) => !r.isFinal)
-        .map((r) => r[0].transcript)
-        .join('')
-        .trim()
-      const final = results
-        .filter((r) => r.isFinal)
-        .map((r) => r[0].transcript)
-        .join('')
-        .trim()
-
-      setInterimText(interim)
-
-      if (final) {
-        isListeningRef.current = false
-        setInterimText('')
-        sendQuestion(final)
-      }
+    if (!vadContextRef.current || vadContextRef.current.state === 'closed') {
+      vadContextRef.current = new (window.AudioContext || window.webkitAudioContext)()
+    }
+    if (vadContextRef.current.state === 'suspended') {
+      vadContextRef.current.resume().catch((err) => {
+        logTime(`[startCall] Failed to resume VAD AudioContext: ${err.message}`)
+      })
     }
 
-    rec.onerror = (e) => {
-      isListeningRef.current = false
-      setInterimText('')
-      if (e.error === 'not-allowed') {
+    navigator.mediaDevices
+      .getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        }
+      })
+      .then((stream) => {
+        logTime(`[startCall] Microphone access granted.`)
+        micStreamRef.current = stream
+        callStartedRef.current = true
+
+        // ── MediaRecorder Setup for Streaming STT ───────────────────────────
+        let options = { mimeType: 'audio/webm;codecs=opus' }
+        if (!MediaRecorder.isTypeSupported(options.mimeType)) {
+          console.warn(`[startCall] audio/webm;codecs=opus not supported. Using default browser audio recorder format.`)
+          options = {}
+        }
+
+        const mediaRecorder = new MediaRecorder(stream, options)
+        mediaRecorderRef.current = mediaRecorder
+
+        mediaRecorder.ondataavailable = (event) => {
+          if (event.data && event.data.size > 0) {
+            const ws = wsRef.current
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              ws.send(event.data)
+            }
+          }
+        }
+
+        mediaRecorder.onstart = () => {
+          logTime(`[startCall] MediaRecorder started.`)
+        }
+
+        mediaRecorder.onerror = (e) => {
+          logTime(`[startCall] MediaRecorder error: ${e.error || e.message}`)
+        }
+
+        // Start recording with 250ms timeslice if STT is ready, otherwise wait for stt_ready
+        if (sttReadyRef.current) {
+          logTime(`[startCall] STT is already ready. Starting MediaRecorder.`)
+          mediaRecorder.start(250)
+        } else {
+          logTime(`[startCall] STT is not ready yet. Waiting for stt_ready event.`)
+        }
+
+        // ── Barge-in callback — fired by VAD when voice detected during agent output ──
+        const bargeIn = () => {
+          const p = phaseRef.current
+          logTime(`[bargeIn] Barge-in callback triggered. currentPhase="${p}"`)
+          if (p !== 'speaking' && p !== 'thinking') {
+            logTime(`[bargeIn] Ignored barge-in because phase is not speaking/thinking.`)
+            return
+          }
+          logTime(`[bargeIn] Executing stopAgentOutput and canceling in-flight response.`)
+          stopAgentOutput()
+          activeReplyIdRef.current = 0
+          pruneInterruptedAssistant()
+          
+          // Send interrupt message to backend
+          const ws = wsRef.current
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'interrupt' }))
+            logTime(`[bargeIn] Sent interrupt message to backend`)
+          }
+          
+          updatePhase('listening')
+          setTimeout(() => {
+            logTime(`[bargeIn] Re-starting listening after 80ms post-bargein delay.`)
+            startListening()
+          }, 80)
+        }
+
+        // Start always-on VAD on this stream
+        startVAD(stream, bargeIn)
+
+        // Play greeting
+        void playAgentReply(
+          "Hello! I'm your TaxOne support agent. How can I help you today?",
+          activeReplyIdRef.current,
+        )
+      })
+      .catch((err) => {
+        logTime(`[startCall] Microphone access denied or failed: ${err.message || err}`)
         setStatusLine('Microphone permission denied. Please allow mic access.')
-        updatePhase('active')
-      }
-      // 'no-speech', 'audio-capture' → onend restarts automatically
-    }
-
-    rec.onend = () => {
-      isListeningRef.current = false
-      setInterimText('')
-      const p = phaseRef.current
-      if (!mutedRef.current && (p === 'listening' || p === 'active')) {
-        setTimeout(() => startListening(), 200)
-      }
-    }
-
-    recognitionRef.current = rec
-    callStartedRef.current = true
-
-    // ── Barge-in callback — fired by VAD when voice detected during agent output ──
-    const bargeIn = () => {
-      const p = phaseRef.current
-      logTime(`[bargeIn] Barge-in callback triggered. currentPhase="${p}"`)
-      if (p !== 'speaking' && p !== 'thinking') {
-        logTime(`[bargeIn] Ignored barge-in because phase is not speaking/thinking.`)
-        return
-      }
-      logTime(`[bargeIn] Executing stopAgentOutput and canceling in-flight response.`)
-      stopAgentOutput()
-      activeReplyIdRef.current = 0
-      pruneInterruptedAssistant()
-      updatePhase('listening')
-      // Small delay so any SpeechRecognition stop() settles before we restart
-      setTimeout(() => {
-        logTime(`[bargeIn] Re-starting listening after 80ms post-bargein delay.`)
-        startListening()
-      }, 80)
-    }
-
-    // Start always-on VAD — runs on a separate AudioContext stream,
-    // independent of SpeechRecognition state.
-    startVAD(bargeIn)
-
-    void playAgentReply(
-      "Hello! I'm your TaxOne support agent. How can I help you today?",
-      activeReplyIdRef.current,
-    )
+        updatePhase('idle')
+      })
   }, [
     sendQuestion,
     startListening,
@@ -828,23 +913,44 @@ export default function App() {
   // ── End call ─────────────────────────────────────────────────────────────
   const endCall = useCallback(() => {
     callStartedRef.current = false
-    const rec = recognitionRef.current
-    if (rec) {
-      rec.onresult = null
-      rec.onerror  = null
-      rec.onend    = null
-      try { rec.stop(); } catch { /* ignore */ }
-      recognitionRef.current = null
+    
+    // Stop MediaRecorder
+    if (mediaRecorderRef.current) {
+      try {
+        if (mediaRecorderRef.current.state !== 'inactive') {
+          mediaRecorderRef.current.stop()
+        }
+      } catch (err) {
+        logTime(`[endCall] Error stopping MediaRecorder: ${err.message || err}`)
+      }
+      mediaRecorderRef.current = null
     }
+
+    // Stop all audio tracks from getUserMedia stream
+    if (micStreamRef.current) {
+      try {
+        micStreamRef.current.getTracks().forEach((track) => track.stop())
+      } catch (err) {
+        logTime(`[endCall] Error stopping mic stream tracks: ${err.message || err}`)
+      }
+      micStreamRef.current = null
+    }
+
     isListeningRef.current = false
     stopAgentOutput()
     stopVAD()
-    // Close AudioContext to free OS audio resources
+    
+    // Close AudioContexts to free OS audio resources
     if (audioCtxRef.current && audioCtxRef.current.state !== 'closed') {
-      audioCtxRef.current.close().catch(() => {})
+      audioCtxRef.current.close().catch(() => { })
       audioCtxRef.current = null
     }
-    replyEpochRef.current    = 0
+    if (vadContextRef.current && vadContextRef.current.state !== 'closed') {
+      vadContextRef.current.close().catch(() => { })
+      vadContextRef.current = null
+    }
+    
+    replyEpochRef.current = 0
     activeReplyIdRef.current = 0
     playbackEpochRef.current = 0
     setMessages([])
@@ -857,15 +963,15 @@ export default function App() {
 
   // ── Derived UI ────────────────────────────────────────────────────────────
   const lastAssistant = messages.filter((m) => m.role === 'assistant').pop()
-  const lastUser      = messages.filter((m) => m.role === 'user').pop()
+  const lastUser = messages.filter((m) => m.role === 'user').pop()
 
   const phaseLabel =
-    phase === 'idle'     ? 'Ready' :
-    isMuted              ? 'Muted' :
-    phase === 'active'   ? 'On call' :
-    phase === 'listening'? 'Listening…' :
-    phase === 'thinking' ? 'Agent is thinking…' :
-                           'Agent is speaking'
+    phase === 'idle' ? 'Ready' :
+      isMuted ? 'Muted' :
+        phase === 'active' ? 'On call' :
+          phase === 'listening' ? 'Listening…' :
+            phase === 'thinking' ? 'Agent is thinking…' :
+              'Agent is speaking'
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col items-center px-4 py-8">
@@ -881,19 +987,18 @@ export default function App() {
         {/* Avatar + status */}
         <div className="px-6 py-10 flex flex-col items-center">
           <div
-            className={`w-32 h-32 rounded-full flex items-center justify-center text-4xl mb-6 transition-all duration-300 ${
-              isMuted
-                ? 'bg-slate-700/50 ring-2 ring-slate-500/40'
-                : phase === 'listening'
+            className={`w-32 h-32 rounded-full flex items-center justify-center text-4xl mb-6 transition-all duration-300 ${isMuted
+              ? 'bg-slate-700/50 ring-2 ring-slate-500/40'
+              : phase === 'listening'
                 ? 'bg-emerald-500/30 ring-4 ring-emerald-400 animate-pulse'
                 : phase === 'thinking'
-                ? 'bg-amber-500/20 ring-2 ring-amber-400/50'
-                : phase === 'speaking'
-                ? 'bg-sky-500/20 ring-2 ring-sky-400/50'
-                : phase === 'active'
-                ? 'bg-emerald-600/20 ring-2 ring-emerald-500/40'
-                : 'bg-slate-800'
-            }`}
+                  ? 'bg-amber-500/20 ring-2 ring-amber-400/50'
+                  : phase === 'speaking'
+                    ? 'bg-sky-500/20 ring-2 ring-sky-400/50'
+                    : phase === 'active'
+                      ? 'bg-emerald-600/20 ring-2 ring-emerald-500/40'
+                      : 'bg-slate-800'
+              }`}
             aria-hidden
           >
             {isMuted ? '🔇' : phase === 'speaking' ? '🔊' : phase === 'listening' ? '🎤' : '🎧'}
@@ -961,11 +1066,10 @@ export default function App() {
               <button
                 type="button"
                 onClick={toggleMute}
-                className={`w-full py-3 rounded-2xl font-medium text-sm transition-colors ${
-                  isMuted
-                    ? 'bg-amber-600/80 hover:bg-amber-500 text-white'
-                    : 'bg-slate-700 hover:bg-slate-600 text-slate-100'
-                }`}
+                className={`w-full py-3 rounded-2xl font-medium text-sm transition-colors ${isMuted
+                  ? 'bg-amber-600/80 hover:bg-amber-500 text-white'
+                  : 'bg-slate-700 hover:bg-slate-600 text-slate-100'
+                  }`}
               >
                 {isMuted ? '🎤 Unmute — click to speak' : '🔇 Mute mic'}
               </button>
@@ -984,8 +1088,16 @@ export default function App() {
       </div>
 
       <p className="text-[11px] text-slate-600 mt-6 text-center max-w-sm">
-        STT: Browser Web Speech API (Chrome) · TTS: Sarvam · VAD: Web Audio API
+        STT: Deepgram Nova-3 · TTS: Sarvam · VAD: Web Audio API
       </p>
     </div>
   )
+}
+
+/** Detect language from character set for speech fallback */
+function detectLanguage(text) {
+  if (!text) return 'en'
+  if (/[\u0A80-\u0AFF]/.test(text)) return 'gu'
+  if (/[\u0900-\u097F]/.test(text)) return 'hi'
+  return 'en'
 }

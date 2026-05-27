@@ -102,13 +102,13 @@ export const config = {
       .trim()
       .toLowerCase(),
     deepgramApiKey: process.env.DEEPGRAM_API_KEY?.trim() ?? "",
-    deepgramModel: process.env.DEEPGRAM_MODEL?.trim() || "nova-2",
-    deepgramLanguage: process.env.DEEPGRAM_LANGUAGE?.trim() || "en-IN",
+    deepgramModel: process.env.DEEPGRAM_MODEL?.trim() || "nova-3",
+    deepgramLanguage: process.env.DEEPGRAM_LANGUAGE?.trim() || "multi",
     sarvamApiKey: process.env.SARVAM_API_KEY?.trim() ?? "",
     sarvamSttModel: process.env.SARVAM_STT_MODEL?.trim() || "saaras:v3",
     sarvamSttLanguage:
       process.env.SARVAM_STT_LANGUAGE?.trim() || "unknown",
-    sarvamTtsModel: process.env.SARVAM_TTS_MODEL?.trim() || "bulbul:v3",
+    sarvamTtsModel: process.env.SARVAM_TTS_MODEL?.trim() || "bulbul:v2",
     sarvamTtsSpeaker: process.env.SARVAM_TTS_SPEAKER?.trim() || "shubh",
     sarvamTtsLang: process.env.SARVAM_TTS_LANG?.trim() || "en-IN",
   },
