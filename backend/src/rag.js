@@ -26,11 +26,7 @@ const MAX_HISTORY_MESSAGES = 6;
 
 /**
  * Chroma cosine distance threshold. If the BEST hit is above this,
- * we treat the retrieval as low-confidence and refuse to answer.
- * Tune this based on your data — start permissive, tighten over time.
- *
- * Range: 0 (perfect match) to 2 (totally unrelated).
- * BGE-M3 typically sits between 0.2 (great) and 0.7 (weak).
+ * treat retrieval as low-confidence and refuse to answer.
  */
 const LOW_CONFIDENCE_THRESHOLD = 0.85;
 
@@ -100,7 +96,6 @@ ${context}`;
 
 /**
  * Build context string with source labels so the LLM knows where each fact comes from.
- * Format: [Module — Title] text...
  */
 function hitsToContextAndSources(hits) {
   const contextParts = [];
@@ -161,10 +156,7 @@ function buildLlmMessages(context, history, question, detectedLang = "en") {
   ];
 }
 
-/**
- * Check if retrieval is confident enough to answer.
- * Returns true if at least the top hit is below the distance threshold.
- */
+/** True if at least the top hit is below the distance threshold. */
 function hasConfidentMatch(hits) {
   if (!hits || hits.length === 0) return false;
   const topScore = hits[0][1];
@@ -181,7 +173,7 @@ export async function ragAnswer(question, history = []) {
   const safeHistory = parseChatHistory(history);
   const detectedLang = detectLanguage(question);
 
-  const hits = await searchSimilar(question, 4);
+  const hits = await searchSimilar(question, 5);
 
   if (hits.length === 0 || !hasConfidentMatch(hits)) {
     return { answer: getNoDocsMsg(detectedLang), sources: [] };
@@ -237,10 +229,9 @@ export async function streamRagAnswer(
 
   console.log(`[${ts()}] [RAG] Lang=${lang} | Searching: "${question.slice(0, 80)}"`);
   const startSearch = Date.now();
-  const hits = await searchSimilar(question, 4);
+  const hits = await searchSimilar(question, 5);
   const searchDuration = Date.now() - startSearch;
 
-  // Log top score for observability
   const topScore = hits[0]?.[1];
   console.log(
     `[${ts()}] [RAG] Search done in ${searchDuration}ms. Hits=${hits.length}, topScore=${topScore?.toFixed(4) ?? "n/a"}`,
@@ -260,7 +251,6 @@ export async function streamRagAnswer(
 
   const { context, sources } = hitsToContextAndSources(hits);
 
-  // Log which modules contributed — useful to spot whether retrieval is on-topic
   const moduleHits = sources.map((s) => s.module).join(", ");
   console.log(`[${ts()}] [RAG] Modules in context: ${moduleHits}`);
 

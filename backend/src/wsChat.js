@@ -72,6 +72,13 @@ export function attachChatSocket(wss, opts) {
       hi: { accumulatedText: "", confidenceSum: 0, confidenceCount: 0, interimText: "", speechFinalReceived: false },
       gu: { accumulatedText: "", confidenceSum: 0, confidenceCount: 0, interimText: "", speechFinalReceived: false }
     };
+    /**
+ * After we trigger a winner, ignore further speech_final events for this many
+ * milliseconds. They're echoes of the same utterance from the other sockets.
+ * Without this, each socket's late speech_final spawns a new RAG call.
+ */
+const POST_TRIGGER_LOCKOUT_MS = 500;
+let postTriggerLockoutUntil = 0;
 
     let keepAliveInterval = null;
     let sttReadySent = false;
@@ -96,65 +103,328 @@ export function attachChatSocket(wss, opts) {
 
     let finalAnswerTimeout = null;
 
-    function checkAndTriggerFinalAnswer() {
-      const allFinished = Object.values(turnState).every(s => s.speechFinalReceived);
-      
-      if (allFinished) {
-        if (finalAnswerTimeout) {
-          clearTimeout(finalAnswerTimeout);
-          finalAnswerTimeout = null;
-        }
+   // ──────────────────────────────────────────────────────────────────────────
+//  Constants for smart winner selection
+// ──────────────────────────────────────────────────────────────────────────
+
+/**
+ * Minimum word count before we trust an early-trigger. Prevents firing on
+ * partial transcripts like "What is" or "How to" that arrive before the
+ * user has actually finished speaking.
+ */
+const MIN_WORDS_FOR_EARLY_TRIGGER = 3;
+
+/**
+ * Confidence threshold for early-trigger (single-socket high-confidence path).
+ * Was 0.92. Kept the same.
+ */
+const EARLY_TRIGGER_CONF = 0.92;
+
+/**
+ * Wait window after first socket finalizes — gives the other sockets a chance
+ * to also report. Improves language detection accuracy at the cost of slight
+ * STT latency increase (~100-200ms).
+ */
+const WINNER_WAIT_MS = 150;
+
+/**
+ * Fallback timeout if waiting too long. If we've already waited this long
+ * for all 3 to report, just go with what we have.
+ */
+const HARD_TIMEOUT_MS = 400;
+
+/**
+ * Count words in a transcript. Handles whitespace and punctuation.
+ */
+function countWords(text) {
+  if (!text) return 0;
+  return text.trim().split(/\s+/).filter(Boolean).length;
+}
+
+/**
+ * Compute a quality score for a finalized transcript.
+ * Higher = better. Combines:
+ *  - Average confidence (0-1)
+ *  - Word count (capped at 8 to avoid super-long transcripts dominating)
+ *  - English preference bonus (Indian users often code-mix; English socket
+ *    is usually more reliable for mixed content)
+ *
+ * @param {{accumulatedText: string, confidenceSum: number, confidenceCount: number}} state
+ * @param {string} lang
+ */
+/**
+ * Detect if a transcript is "Latin script dominant" — i.e., mostly English
+ * letters and ASCII punctuation. This is the strongest signal that the user
+ * actually spoke English, even when the Hindi socket also transcribed it.
+ */
+function isLatinScriptDominant(text) {
+  if (!text) return false;
+  // Count ASCII letters vs Devanagari/Gujarati script characters
+  let latinChars = 0;
+  let indicChars = 0;
+  for (const ch of text) {
+    const code = ch.codePointAt(0);
+    if ((code >= 65 && code <= 90) || (code >= 97 && code <= 122)) {
+      latinChars++;
+    } else if (
+      // Devanagari (Hindi) range
+      (code >= 0x0900 && code <= 0x097F) ||
+      // Gujarati range
+      (code >= 0x0A80 && code <= 0x0AFF)
+    ) {
+      indicChars++;
+    }
+  }
+  // If 70%+ of letter-chars are Latin, treat as English speech
+  const total = latinChars + indicChars;
+  if (total === 0) return false;
+  return latinChars / total >= 0.7;
+}
+
+/**
+ * Detect if a Hindi transcript is "Devanagari dominant" — mostly Hindi script.
+ * Used to confirm user actually spoke Hindi (not English transcribed by Hindi model).
+ */
+function isDevanagariDominant(text) {
+  if (!text) return false;
+  let latinChars = 0;
+  let devChars = 0;
+  for (const ch of text) {
+    const code = ch.codePointAt(0);
+    if ((code >= 65 && code <= 90) || (code >= 97 && code <= 122)) {
+      latinChars++;
+    } else if (code >= 0x0900 && code <= 0x097F) {
+      devChars++;
+    }
+  }
+  const total = latinChars + devChars;
+  if (total === 0) return false;
+  return devChars / total >= 0.5;
+}
+
+/**
+ * Detect if a Gujarati transcript is "Gujarati script dominant".
+ */
+function isGujaratiDominant(text) {
+  if (!text) return false;
+  let latinChars = 0;
+  let gujChars = 0;
+  for (const ch of text) {
+    const code = ch.codePointAt(0);
+    if ((code >= 65 && code <= 90) || (code >= 97 && code <= 122)) {
+      latinChars++;
+    } else if (code >= 0x0A80 && code <= 0x0AFF) {
+      gujChars++;
+    }
+  }
+  const total = latinChars + gujChars;
+  if (total === 0) return false;
+  return gujChars / total >= 0.5;
+}
+
+function scoreTranscript(state, lang) {
+  const text = state.accumulatedText.trim();
+  if (!text) return 0;
+
+  const avgConf = state.confidenceCount > 0
+    ? state.confidenceSum / state.confidenceCount
+    : 0;
+
+  const wordCount = countWords(text);
+  if (wordCount < 1) return 0;
+
+  const wordFactor = Math.min(wordCount, 8) / 8;
+  let score = avgConf * (0.5 + 0.5 * wordFactor);
+
+  // ── Script-aware scoring (the key fix) ─────────────────────────────────
+  //
+  // Each Deepgram socket is optimized for one language. The transcript SCRIPT
+  // tells us what the user *actually* spoke:
+  //  - Latin script in en/hi/gu sockets → user spoke English
+  //  - Devanagari in hi socket → user spoke Hindi
+  //  - Gujarati script in gu socket → user spoke Gujarati
+  //
+  // We BOOST sockets whose script matches what they're supposed to handle,
+  // and PENALIZE sockets transcribing in a script that doesn't match their
+  // language (which usually means low-quality cross-language transcription).
+
+  const latinDominant = isLatinScriptDominant(text);
+
+  if (lang === "en") {
+    // English socket should produce Latin text. If it does, big boost.
+    if (latinDominant) score += 0.20;
+    else score -= 0.10; // English socket producing Hindi/Gujarati script? Weird, penalize
+  } else if (lang === "hi") {
+    // Hindi socket: ideal is Devanagari. Latin-only means it transcribed English.
+    if (latinDominant) {
+      score -= 0.15; // English speech being routed to Hindi answer is bad
+    } else if (isDevanagariDominant(text)) {
+      score += 0.10;
+    }
+  } else if (lang === "gu") {
+    // Gujarati socket: ideal is Gujarati script.
+    if (latinDominant) {
+      score -= 0.15; // English speech transcribed phonetically as Gujarati — bad
+    } else if (isGujaratiDominant(text)) {
+      score += 0.10;
+    }
+  }
+
+  return score;
+}
+
+function checkAndTriggerFinalAnswer() {
+  const finalized = Object.entries(turnState).filter(
+    ([, s]) => s.speechFinalReceived,
+  );
+  const finalizedCount = finalized.length;
+
+  // Fast path: all 3 finalized → trigger immediately
+  if (finalizedCount === 3) {
+    if (finalAnswerTimeout) {
+      clearTimeout(finalAnswerTimeout);
+      finalAnswerTimeout = null;
+    }
+    triggerWinner();
+    return;
+  }
+
+  // First socket just finalized → check if it's strong enough alone
+  if (finalizedCount === 1) {
+    const [lang, state] = finalized[0];
+    const text = state.accumulatedText.trim();
+    const avgConf = state.confidenceCount > 0
+      ? state.confidenceSum / state.confidenceCount
+      : 0;
+    const wordCount = countWords(text);
+
+    // STRONG-AND-LONG path: super-confident transcript with enough words
+    // skips the wait — fastest path, ~70-100ms STT latency
+   // STRONG-AND-LONG path: super-confident long transcript.
+// BUT — we still wait briefly for other sockets, because Deepgram's Hindi
+// model often confidently transcribes English speech (or vice versa),
+// and we need to compare across languages to pick the right one.
+//
+// Wait is SHORTER than the regular path (75ms vs 150ms) since this socket
+// already has high-quality content — we just want a quick cross-check.
+if (
+  avgConf >= 0.98 &&
+  wordCount >= MIN_WORDS_FOR_EARLY_TRIGGER &&
+  text.length >= 12
+) {
+  if (!finalAnswerTimeout) {
+    console.log(
+      `[${ts()}] ⚡ Strong-and-long detected on ${lang}, brief 75ms cross-check wait (conf=${avgConf.toFixed(2)}, words=${wordCount})`,
+    );
+    finalAnswerTimeout = setTimeout(() => {
+      finalAnswerTimeout = null;
+      triggerWinner();
+    }, 75);
+  }
+  return;
+}
+
+    // Otherwise: schedule a SHORT wait to let other sockets weigh in
+    if (!finalAnswerTimeout) {
+      console.log(
+        `[${ts()}] ⏳ First socket (${lang}) finalized but waiting ${WINNER_WAIT_MS}ms for others (conf=${avgConf.toFixed(2)}, words=${wordCount})`,
+      );
+      finalAnswerTimeout = setTimeout(() => {
+        finalAnswerTimeout = null;
         triggerWinner();
-      } else {
-        if (!finalAnswerTimeout) {
-          finalAnswerTimeout = setTimeout(() => {
-            console.log(`[${ts()}] ⏰ Turn timeout reached. Triggering winner based on available transcripts.`);
-            finalAnswerTimeout = null;
-            triggerWinner();
-          }, 250);
-        }
-      }
+      }, WINNER_WAIT_MS);
+    }
+    return;
+  }
+
+  // Two finalized → if either is good, trigger now (don't wait for third)
+  if (finalizedCount === 2) {
+    if (finalAnswerTimeout) {
+      clearTimeout(finalAnswerTimeout);
+      finalAnswerTimeout = null;
     }
 
-    function triggerWinner() {
-      let winnerLang = "en";
-      let maxConfidence = -1;
-      let winnerText = "";
+    // Quick check: is at least one of these good enough?
+    const hasUsable = finalized.some(([lang, s]) => {
+      const text = s.accumulatedText.trim();
+      const wc = countWords(text);
+      const conf = s.confidenceCount > 0 ? s.confidenceSum / s.confidenceCount : 0;
+      return wc >= MIN_WORDS_FOR_EARLY_TRIGGER && conf >= EARLY_TRIGGER_CONF;
+    });
 
-      console.log(`[${ts()}] 📊 Evaluating transcripts for the current turn:`);
-      for (const lang of ["en", "hi", "gu"]) {
-        const state = turnState[lang];
-        const text = state.accumulatedText.trim();
-        const avgConf = state.confidenceCount > 0 ? state.confidenceSum / state.confidenceCount : 0;
-        console.log(`   - [${lang}]: "${text}" (avg conf: ${avgConf.toFixed(3)}, chunks: ${state.confidenceCount})`);
-        
-        if (text && avgConf > maxConfidence) {
-          maxConfidence = avgConf;
-          winnerLang = lang;
-          winnerText = text;
-        }
-      }
-
-      // Reset turn state
-      for (const lang of ["en", "hi", "gu"]) {
-        turnState[lang] = {
-          accumulatedText: "",
-          confidenceSum: 0,
-          confidenceCount: 0,
-          interimText: "",
-          speechFinalReceived: false
-        };
-      }
-
-      if (winnerText) {
-        const now = Date.now();
-        const sttLatency = lastAudioTime ? now - lastAudioTime : 0;
-        console.log(`[${ts()}] 🏆 Winner language: "${winnerLang}" with transcript: "${winnerText}" (STT Latency: ${sttLatency}ms)`);
-        void triggerRagReply(winnerText, null, sttLatency, winnerLang);
-      } else {
-        console.log(`[${ts()}] ⚠️ No non-empty transcripts found for this turn.`);
-      }
+    if (hasUsable) {
+      console.log(`[${ts()}] ⚡ 2 sockets finalized, at least one is usable. Triggering.`);
+      triggerWinner();
+      return;
     }
+
+    // Neither is great — wait briefly for the third (hard cap)
+    if (!finalAnswerTimeout) {
+      finalAnswerTimeout = setTimeout(() => {
+        finalAnswerTimeout = null;
+        triggerWinner();
+      }, HARD_TIMEOUT_MS - WINNER_WAIT_MS); // total budget enforced
+    }
+    return;
+  }
+
+  // No sockets finalized yet — set a hard timeout safety net
+  if (!finalAnswerTimeout) {
+    finalAnswerTimeout = setTimeout(() => {
+      console.log(`[${ts()}] ⏰ Hard timeout reached. Triggering with available transcripts.`);
+      finalAnswerTimeout = null;
+      triggerWinner();
+    }, HARD_TIMEOUT_MS);
+  }
+}
+function triggerWinner() {
+  let winnerLang = "en";
+  let maxScore = -1;
+  let winnerText = "";
+
+  console.log(`[${ts()}] 📊 Evaluating transcripts for the current turn:`);
+  for (const lang of ["en", "hi", "gu"]) {
+    const state = turnState[lang];
+    const text = state.accumulatedText.trim();
+    const avgConf = state.confidenceCount > 0 ? state.confidenceSum / state.confidenceCount : 0;
+    const wordCount = countWords(text);
+    const score = scoreTranscript(state, lang);
+
+    console.log(
+      `   - [${lang}]: "${text}" (conf=${avgConf.toFixed(3)}, words=${wordCount}, score=${score.toFixed(3)})`,
+    );
+
+    if (text && score > maxScore) {
+      maxScore = score;
+      winnerLang = lang;
+      winnerText = text;
+    }
+  }
+
+  // Reset turn state
+  for (const lang of ["en", "hi", "gu"]) {
+    turnState[lang] = {
+      accumulatedText: "",
+      confidenceSum: 0,
+      confidenceCount: 0,
+      interimText: "",
+      speechFinalReceived: false
+    };
+  }
+
+  if (winnerText) {
+    const now = Date.now();
+    const sttLatency = lastAudioTime ? now - lastAudioTime : 0;
+    console.log(`[${ts()}] 🏆 Winner: "${winnerLang}" with "${winnerText}" (score=${maxScore.toFixed(3)}, STT Latency: ${sttLatency}ms)`);
+  
+    // Set lockout — late speech_final from other sockets will be ignored
+    postTriggerLockoutUntil = now + POST_TRIGGER_LOCKOUT_MS;
+  
+    void triggerRagReply(winnerText, null, sttLatency, winnerLang);
+  } else {
+    console.log(`[${ts()}] ⚠️ No non-empty transcripts found for this turn.`);
+  }
+}
 
     if (dgKey) {
       const languages = ["en", "hi", "gu"];
@@ -163,7 +433,14 @@ export function attachChatSocket(wss, opts) {
         const dgQueryParams = new URLSearchParams({
           model: config.voice.deepgramModel || "nova-3",
           language: lang,
-          endpointing: "300",
+          // Endpointing: ms of silence before Deepgram declares end-of-speech.
+          // 200ms is the practical floor for Indian-language voice agents.
+          // Lower than this risks cutting mid-sentence on natural pauses.
+          endpointing: "200",
+          // Hard cutoff: if no speech_final after this much time, force one.
+          utterance_end_ms: "1000",
+          // VAD events let us detect speech-start early (useful for barge-in).
+          vad_events: "true",
           interim_results: "true",
           smart_format: "true",
           punctuate: "true",
@@ -221,8 +498,26 @@ export function attachChatSocket(wss, opts) {
               sendInterimUpdate();
 
               if (speechFinal && isFinal) {
+                // Drop late echoes from other sockets after a winner was already triggered
+                if (Date.now() < postTriggerLockoutUntil) {
+                  console.log(
+                    `[${ts()}] 🔇 Deepgram [${lang}] speech_final ignored (post-trigger lockout active, ${postTriggerLockoutUntil - Date.now()}ms left)`,
+                  );
+                  // Reset this socket's state so it's clean for the next real utterance
+                  turnState[lang] = {
+                    accumulatedText: "",
+                    confidenceSum: 0,
+                    confidenceCount: 0,
+                    interimText: "",
+                    speechFinalReceived: false,
+                  };
+                  return;
+                }
+              
                 turnState[lang].speechFinalReceived = true;
-                console.log(`[${ts()}] 🎙️ Deepgram [${lang}] speech_final received: "${turnState[lang].accumulatedText}" (conf: ${confidence.toFixed(2)})`);
+                console.log(
+                  `[${ts()}] 🎙️ Deepgram [${lang}] speech_final received: "${turnState[lang].accumulatedText}" (conf: ${confidence.toFixed(2)})`,
+                );
                 checkAndTriggerFinalAnswer();
               }
             }

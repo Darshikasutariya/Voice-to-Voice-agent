@@ -56,6 +56,7 @@ export const config = {
     pooling: "cls",
     normalize: true,
     batchSize: 8,
+    dtype: (process.env.EMBED_DTYPE?.trim() || "q8").toLowerCase(),
   },
   chroma: {
     url: process.env.CHROMA_URL || "http://localhost:8000",

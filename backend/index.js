@@ -12,6 +12,8 @@ import { attachChatSocket } from "./src/wsChat.js";
 import { extractHttpApiKey, isChatApiKeyValid } from "./src/security.js";
 import { transcribeAudio } from "./src/voice/transcribe.js";
 import { synthesizeSarvam } from "./src/voice/sarvamTts.js";
+// ── NEW: import retrieval so we can pre-warm the embedder + Chroma at boot ──
+import { searchSimilar } from "./src/retrieval.js";
 
 const app = express();
 
@@ -195,6 +197,31 @@ attachChatSocket(wss, {
 
 const browserHost = host === "0.0.0.0" ? "localhost" : host;
 
+// ─────────────────────────────────────────────────────────────────────────
+//  Pre-warm RAG pipeline at boot.
+//
+//  First user query was taking ~4.8 seconds because BGE-M3 (~500MB ONNX)
+//  was loading lazily on first call. We force-load it now so the first
+//  real user gets the same fast path (~150ms) as subsequent queries.
+//
+//  Failure is NOT fatal — server still starts, just without the warm cache.
+// ─────────────────────────────────────────────────────────────────────────
+async function prewarmRetrieval() {
+  const start = Date.now();
+  console.log("  ⏳ Pre-warming retrieval pipeline (BGE-M3 + Chroma)…");
+  try {
+    // Real query string is fine here — Chroma needs a non-empty vector to test.
+    await searchSimilar("warmup query for embedder and vector store", 1);
+    const ms = Date.now() - start;
+    console.log(`  ✅ Retrieval ready in ${ms}ms (first user query will be fast)`);
+  } catch (err) {
+    console.warn(
+      `  ⚠️  Pre-warm failed (not fatal — first query will load model): ${err?.message || err}`,
+    );
+  }
+  console.log("─".repeat(55));
+}
+
 server.listen(port, host, () => {
   console.log("─".repeat(55));
   console.log("  🎙️  TaxOne Voice Agent — backend ready");
@@ -205,6 +232,9 @@ server.listen(port, host, () => {
     console.log("  Auth      : CHAT_API_KEY is set");
   }
   console.log("─".repeat(55));
-  console.log("  Waiting for connections… (each Q&A will log below)");
-  console.log("─".repeat(55));
+
+  // Fire pre-warm asynchronously — server is already listening, so client
+  // connections work immediately. They just won't get fast retrieval until
+  // pre-warm completes (which is the same behavior as before).
+  void prewarmRetrieval();
 });

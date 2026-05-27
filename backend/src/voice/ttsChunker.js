@@ -5,159 +5,239 @@ function ts() {
   return `${d.toLocaleTimeString("en-IN", { hour12: false })}.${String(d.getMilliseconds()).padStart(3, "0")}`;
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+//  TUNING CONSTANTS — adjust these to trade latency vs. chunk efficiency
+// ────────────────────────────────────────────────────────────────────────────
+
 /**
- * Flush a sentence when we see .  !  ? (with optional closing quotes/brackets)
- * followed by whitespace OR end-of-string.
+ * Minimum characters before we'll dispatch ANY chunk (except final flush).
+ * 5-char chunks waste a full ~500ms Sarvam round-trip — much better to
+ * wait one more token and send a bigger payload.
+ */
+const MIN_DISPATCH_CHARS = 8;
+
+/**
+ * Minimum chars before the FIRST chunk fires. Lower = faster time-to-first-audio
+ * but smaller initial payload. 12 is a good sweet spot — usually one short phrase.
+ */
+const MIN_FIRST_CHUNK_CHARS = 12;
+
+/**
+ * If buffer has this many chars at a sentence boundary, flush it as a chunk.
+ * Lower than MIN_DISPATCH_CHARS would conflict so we use the max of the two.
+ */
+const MIN_SENTENCE_CHARS = 8;
+
+/**
+ * Clause boundaries (comma, semicolon) need more chars before splitting,
+ * otherwise we'd cut things like "1, 2, 3" into useless tiny chunks.
+ */
+const MIN_CLAUSE_CHARS = 12;
+
+/**
+ * Word threshold: if buffer has this many words without hitting any boundary,
+ * force a split. Prevents long runs of words from never being chunked.
+ */
+const WORD_FLUSH_THRESHOLD = 10;
+
+/**
+ * If no boundary appears but we have text, force-flush after this delay.
+ * Lower = more responsive but smaller chunks.
+ */
+const TIMEOUT_FLUSH_MS = 200;
+
+/**
+ * Minimum buffer size before the timeout timer starts. Below this, we wait
+ * for more text rather than firing a wasteful tiny chunk.
+ */
+const TIMEOUT_MIN_BUFFER = 10;
+
+// ────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Creates a streaming text → TTS chunker with ORDERED dispatch.
  *
- * Using a look-ahead so the whitespace character stays in the remaining buffer.
- */
-const SENTENCE_END_RE = /[.!?]['")\]]*(?=\s|$)/;
-
-/**
- * Flush a clause when we see ,  ;  : followed by a space.
- * Requires more chars in the buffer before we split here.
- */
-const CLAUSE_END_RE = /[,;:]\s/;
-
-/** Minimum characters at the split point before a sentence flush triggers */
-const MIN_SENTENCE_CHARS = 15;
-
-/** Minimum total buffer length before a clause flush triggers */
-const MIN_CLAUSE_CHARS = 35;
-
-/** Force-flush timeout when no boundary is found but we have text */
-const TIMEOUT_FLUSH_MS = 450;
-
-/** Minimum buffer length before we start the timeout timer */
-const MIN_TIMEOUT_CHARS = 15;
-
-/**
- * Creates a streaming text → TTS chunker.
+ * Important behaviour:
+ *  - Chunks dispatched to Sarvam in parallel (fast)
+ *  - But sent to the client IN ORDER (no audio gaps from late-returning chunks)
+ *  - First chunk fires aggressively for fast time-to-first-audio
+ *  - Tiny fragments are merged into the next chunk, not sent alone
  *
  * Usage:
  *   const chunker = createTtsChunker({ sendFn, signal, targetLanguageCode });
- *   for each LLM token:  chunker.push(tokenText)
- *   when LLM done:       await chunker.flush()
+ *   chunker.push(token)                  // for each LLM token
+ *   await chunker.flush()                // at end of stream
  *
  * @param {{
  *   sendFn: (chunkId: number, base64Audio: string | null) => void,
  *   signal?: AbortSignal,
  *   targetLanguageCode?: string
  * }} opts
- * @returns {{ push: (text: string) => void, flush: () => Promise<void> }}
  */
 export function createTtsChunker({ sendFn, signal, targetLanguageCode }) {
-  let buffer     = "";
-  let nextChunkId = 0;   // ID to assign to the next dispatched chunk
+  let buffer = "";
+  let nextChunkId = 0;
+  let isFirstChunk = true;       // First chunk uses lower thresholds
 
-  const pending  = [];        // Promise[] — one per dispatched TTS call
+  /** All dispatched TTS promises (for flush() to await) */
+  const pending = [];
+
+  /** Map of chunkId → audio | null. Chunks held here until in-order send is possible. */
+  const readyChunks = new Map();
+  let nextSendId = 0;            // The chunkId we're currently waiting to send
+
   let timeoutHandle = null;
-  let aborted       = false;
+  let aborted = false;
 
-  // ── Abort handler ────────────────────────────────────────────────────────
+  // ── Abort handling ────────────────────────────────────────────────────────
   signal?.addEventListener(
     "abort",
     () => {
       aborted = true;
-      if (timeoutHandle) { clearTimeout(timeoutHandle); timeoutHandle = null; }
+      if (timeoutHandle) {
+        clearTimeout(timeoutHandle);
+        timeoutHandle = null;
+      }
       buffer = "";
+      readyChunks.clear();
     },
     { once: true },
   );
 
-  // ── Dispatch a TTS call for one text chunk ────────────────────────────────
+  // ── Ordered dispatch: drain readyChunks in chunkId order ──────────────────
+  function drainOrderedSends() {
+    while (readyChunks.has(nextSendId)) {
+      const audio = readyChunks.get(nextSendId);
+      readyChunks.delete(nextSendId);
+      const idToSend = nextSendId;
+      nextSendId++;
+
+      if (aborted) continue;
+      try {
+        sendFn(idToSend, audio);
+        console.log(`[${ts()}] [TTS-Chunker] ▶ Sent chunk #${idToSend} (in order)`);
+      } catch {
+        // socket may have closed — keep draining the rest anyway
+      }
+    }
+  }
+
+  // ── Dispatch one text chunk to Sarvam (parallel synthesis, ordered send) ──
   function dispatchChunk(text) {
     const trimmed = text.trim();
     if (!trimmed || aborted) return;
 
     const chunkId = nextChunkId++;
+    const startTime = Date.now();
     console.log(
-      `[${ts()}] [TTS-Chunker] 🔊 Dispatching TTS chunk #${chunkId}: "${trimmed.slice(0, 60)}"`,
+      `[${ts()}] [TTS-Chunker] 🔊 Dispatching chunk #${chunkId} (${trimmed.length} chars): "${trimmed.slice(0, 60)}"`,
     );
 
     const p = synthesizeSarvamBase64(trimmed, targetLanguageCode, signal)
       .then((b64) => {
         if (aborted) return;
-        console.log(`[${ts()}] [TTS-Chunker] ▶ Sending chunk #${chunkId} immediately`);
-        try { sendFn(chunkId, b64); } catch { /* socket may have closed */ }
+        const ms = Date.now() - startTime;
+        console.log(`[${ts()}] [TTS-Chunker] ✓ Chunk #${chunkId} synth done in ${ms}ms`);
+        // Store and drain (sends are ordered, not first-come-first-served)
+        readyChunks.set(chunkId, b64);
+        drainOrderedSends();
       })
       .catch((err) => {
         if (aborted) return;
         console.error(
           `[${ts()}] [TTS-Chunker] ❌ Chunk #${chunkId} failed: ${err.message}`,
         );
-        // Mark null/failed so the client's queue doesn't wait
-        try { sendFn(chunkId, null); } catch { }
+        // Send null to unblock the frontend queue
+        readyChunks.set(chunkId, null);
+        drainOrderedSends();
       });
 
     pending.push(p);
+    isFirstChunk = false;
   }
 
   // ── Timeout helpers ───────────────────────────────────────────────────────
   function clearTimer() {
-    if (timeoutHandle) { clearTimeout(timeoutHandle); timeoutHandle = null; }
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+      timeoutHandle = null;
+    }
   }
-
-  const TIMEOUT_FLUSH_MS = 200; // 200ms token pause triggers flush
 
   function scheduleTimeout() {
     if (timeoutHandle || aborted) return;
     timeoutHandle = setTimeout(() => {
       timeoutHandle = null;
-      if (buffer.trim() && !aborted) {
-        console.log(`[${ts()}] [TTS-Chunker] ⏰ Timeout flush: "${buffer.slice(0, 50)}"`);
+      // Only flush if buffer is reasonably sized — avoids tiny chunks
+      if (buffer.trim().length >= MIN_DISPATCH_CHARS && !aborted) {
+        console.log(
+          `[${ts()}] [TTS-Chunker] ⏰ Timeout flush (${buffer.length} chars): "${buffer.slice(0, 50)}"`,
+        );
         dispatchChunk(buffer);
         buffer = "";
+      } else if (buffer.trim() && !aborted) {
+        // Buffer too small — schedule another timeout for more text
+        scheduleTimeout();
       }
     }, TIMEOUT_FLUSH_MS);
   }
 
-  // ── Extract all available chunks from the buffer ──────────────────────────
+  // ── Try to extract one or more chunks from the buffer ─────────────────────
   function extractChunks() {
-    let anyExtracted = false;
+    let extracted = false;
+
     while (!aborted) {
-      // 1. Check for sentence end punctuation: . ! ? । | followed by whitespace or end
+      const bufLen = buffer.trim().length;
+
+      // Determine minimum for THIS chunk
+      const minForThisChunk = isFirstChunk ? MIN_FIRST_CHUNK_CHARS : MIN_DISPATCH_CHARS;
+
+      // Don't even try to chunk if we're below the minimum
+      if (bufLen < minForThisChunk) break;
+
+      // 1. Sentence boundary: . ! ? । |  (with optional closing quotes/brackets)
       const sm = /[.!?।|]+['")\]]*(?=\s|$)/.exec(buffer);
       if (sm !== null) {
         const cutAt = sm.index + sm[0].length;
-        if (cutAt >= 6) { // Small sentence chunk
+        if (cutAt >= MIN_SENTENCE_CHARS) {
           const chunk = buffer.slice(0, cutAt);
           buffer = buffer.slice(cutAt).trimStart();
           dispatchChunk(chunk);
-          anyExtracted = true;
+          extracted = true;
           continue;
         }
       }
 
-      // 2. Check for clause end punctuation: , ; : — followed by whitespace
+      // 2. Clause boundary: , ; : —
       const cm = /[,;:—]+(?=\s|$)/.exec(buffer);
       if (cm !== null) {
         const cutAt = cm.index + cm[0].length;
-        if (cutAt >= 10) { // Medium clause chunk
+        if (cutAt >= MIN_CLAUSE_CHARS) {
           const chunk = buffer.slice(0, cutAt);
           buffer = buffer.slice(cutAt).trimStart();
           dispatchChunk(chunk);
-          anyExtracted = true;
+          extracted = true;
           continue;
         }
       }
 
-      // 3. Word threshold: if we have 10 or more words, split at the last space
+      // 3. Word-count threshold: split at last space if we have many words
       const words = buffer.trim().split(/\s+/);
-      if (words.length >= 10) {
+      if (words.length >= WORD_FLUSH_THRESHOLD) {
         const lastSpaceIndex = buffer.lastIndexOf(" ");
-        if (lastSpaceIndex !== -1 && lastSpaceIndex >= 10) {
+        if (lastSpaceIndex >= MIN_DISPATCH_CHARS) {
           const chunk = buffer.slice(0, lastSpaceIndex);
           buffer = buffer.slice(lastSpaceIndex).trimStart();
           dispatchChunk(chunk);
-          anyExtracted = true;
+          extracted = true;
           continue;
         }
       }
 
-      break;
+      break; // no more boundaries found
     }
-    return anyExtracted;
+
+    return extracted;
   }
 
   // ── Public API ────────────────────────────────────────────────────────────
@@ -168,7 +248,8 @@ export function createTtsChunker({ sendFn, signal, targetLanguageCode }) {
     buffer += text;
     clearTimer();
     extractChunks();
-    if (buffer.trim()) {
+    // Schedule timeout only if buffer has meaningful content
+    if (buffer.trim().length >= TIMEOUT_MIN_BUFFER) {
       scheduleTimeout();
     }
   }
@@ -176,15 +257,20 @@ export function createTtsChunker({ sendFn, signal, targetLanguageCode }) {
   /**
    * Flush any remaining buffer text, then await all in-flight TTS calls.
    * Call once when the LLM stream ends.
+   *
+   * Unlike push(), this WILL send small remaining text (the tail of the
+   * response). A 4-char "okay." at the end is better sent than dropped.
    */
   async function flush() {
     if (aborted) return;
     clearTimer();
     if (buffer.trim()) {
+      console.log(
+        `[${ts()}] [TTS-Chunker] 🏁 Final flush (${buffer.length} chars): "${buffer.slice(0, 50)}"`,
+      );
       dispatchChunk(buffer);
       buffer = "";
     }
-    // Wait for every TTS promise (success or failure)
     await Promise.allSettled(pending);
   }
 
